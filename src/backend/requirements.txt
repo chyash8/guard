@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+screen-brightness-control
+bleak
+pyalsaaudio
