@@ -1,0 +1,474 @@
+from flask import Flask, jsonify, request
+from flask_socketio import SocketIO
+from flask_cors import CORS
+import subprocess
+import json
+import logging
+import threading
+import time
+from datetime import datetime
+import psutil
+
+# Configure logging
+logging.basicConfig(level=logging.DEBUG,
+                   format='%(asctime)s - %(levelname)s - %(message)s')
+ 
+app = Flask(__name__)
+CORS(app)
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+def run_cmd(command):
+    """Run a command and return output"""
+    try:
+        result = subprocess.run(command, capture_output=True, text=True)
+        logging.debug(f"Command: {' '.join(command)}")
+        logging.debug(f"Output: {result.stdout}")
+        logging.debug(f"Error: {result.stderr}")
+        return result
+    except Exception as e:
+        logging.error(f"Error running command {command}: {str(e)}")
+        return None
+
+def get_wifi_networks():
+    """Get list of available WiFi networks using iwlist"""
+    try:
+        logging.info("Scanning for WiFi networks...")
+        
+        # Check if interface exists
+        check = run_cmd(['iwconfig'])
+        if not check or "no wireless extensions" in check.stdout:
+            logging.error("No wireless interface found")
+            return []
+
+        # Force a scan
+        run_cmd(['sudo', 'iwlist', 'wlan0', 'scan'])
+        time.sleep(2)  # Give some time for the scan to complete
+        
+        # Get scan results
+        result = run_cmd(['sudo', 'iwlist', 'wlan0', 'scan'])
+        if not result or result.returncode != 0:
+            logging.error(f"Scan failed: {result.stderr if result else 'No result'}")
+            return []
+
+        networks = []
+        current_network = None
+        
+        # Parse iwlist scan output
+        for line in result.stdout.split('\n'):
+            line = line.strip()
+            
+            if "Cell" in line:
+                if current_network:
+                    networks.append(current_network)
+                current_network = {'signal': 0, 'security': 'Unknown'}
+            elif current_network:
+                if "ESSID:" in line:
+                    ssid = line.split('ESSID:"')[1].split('"')[0]
+                    if ssid:
+                        current_network['ssid'] = ssid
+                elif "Quality=" in line:
+                    try:
+                        # Convert link quality to percentage
+                        quality = line.split('Quality=')[1].split(' ')[0]
+                        num, denom = quality.split('/')
+                        current_network['signal'] = int((float(num) / float(denom)) * 100)
+                    except (ValueError, IndexError):
+                        current_network['signal'] = 0
+                elif "Encryption key:" in line:
+                    current_network['security'] = 'WPA/WPA2' if "on" in line else 'None'
+        
+        # Add the last network if exists
+        if current_network and 'ssid' in current_network:
+            networks.append(current_network)
+        
+        logging.info(f"Found {len(networks)} networks")
+        return networks
+       
+    except Exception as e:
+        logging.error(f"Error scanning networks: {str(e)}")
+        return []
+ 
+def get_current_connection():
+    """Get current WiFi connection details"""
+    try:
+        result = run_cmd(['iwconfig', 'wlan0'])
+        if not result:
+            return None
+
+        current_network = None
+        signal_strength = None
+        
+        for line in result.stdout.split('\n'):
+            line = line.strip()
+            if 'ESSID:' in line:
+                ssid = line.split('ESSID:"')[1].split('"')[0]
+                if ssid:
+                    current_network = {'ssid': ssid}
+            elif "Quality=" in line:
+                try:
+                    quality = line.split('Quality=')[1].split(' ')[0]
+                    num, denom = quality.split('/')
+                    signal_strength = int((float(num) / float(denom)) * 100)
+                except (ValueError, IndexError):
+                    signal_strength = 0
+
+        if current_network:
+            current_network.update({
+                'signal': signal_strength or 0,
+                'security': 'Unknown'  # Could be improved with more parsing
+            })
+        return current_network
+
+    except Exception as e:
+        logging.error(f"Error getting current connection: {str(e)}")
+        return None
+ 
+def connect_to_network(ssid, password=None):
+    """Connect to a WiFi network using wpa_supplicant"""
+    try:
+        # Create wpa_supplicant configuration
+        if password:
+            # For networks with password
+            config = f'''network={{
+    ssid="{ssid}"
+    psk="{password}"
+    key_mgmt=WPA-PSK
+}}'''
+        else:
+            # For open networks
+            config = f'''network={{
+    ssid="{ssid}"
+    key_mgmt=NONE
+}}'''
+ 
+        # Save configuration to temporary file
+        config_path = '/tmp/wpa_supplicant.conf'
+        with open(config_path, 'w') as f:
+            f.write(config)
+
+        # Stop any existing wpa_supplicant
+        run_cmd(['sudo', 'killall', 'wpa_supplicant'])
+        
+        # Start wpa_supplicant with new config
+        result = run_cmd(['sudo', 'wpa_supplicant', '-B', '-i', 'wlan0', '-c', config_path])
+        if not result or result.returncode != 0:
+            logging.error(f"Failed to start wpa_supplicant: {result.stderr if result else 'No result'}")
+            return False
+        
+        # Get IP using DHCP
+        result = run_cmd(['sudo', 'dhclient', 'wlan0'])
+        if not result or result.returncode != 0:
+            logging.error(f"Failed to get IP via DHCP: {result.stderr if result else 'No result'}")
+            return False
+       
+        return True
+
+    except Exception as e:
+        logging.error(f"Error connecting to network: {str(e)}")
+        return False
+ 
+def disconnect_wifi():
+    """Disconnect from current WiFi network"""
+    try:
+        # Kill wpa_supplicant and dhclient
+        run_cmd(['sudo', 'killall', 'wpa_supplicant', 'dhclient'])
+        
+        # Release IP and bring interface down
+        run_cmd(['sudo', 'ip', 'addr', 'flush', 'dev', 'wlan0'])
+        run_cmd(['sudo', 'ifconfig', 'wlan0', 'down'])
+        
+        return True
+    except Exception as e:
+        logging.error(f"Error disconnecting: {str(e)}")
+        return False
+ 
+# System state with optimized intervals
+system_state = {
+    'wifi_enabled': False,
+    'wifi_networks': [],
+    'current_network': None,
+    'last_check_time': 0,
+    'last_scan_time': 0,
+    'last_metrics': None,
+    'check_interval': 1,    # Check connection every 1 second
+    'scan_interval': 10,    # Scan networks every 10 seconds
+    'metrics_interval': 0.5  # Update metrics every 500ms
+}
+ 
+def check_wifi_status():
+    """Check current WiFi status and update system state"""
+    try:
+        current_time = time.time()
+       
+        # Use cached value if check interval hasn't elapsed
+        if (current_time - system_state['last_check_time']) < system_state['check_interval']:
+            return bool(system_state['current_network']), system_state['current_network']
+           
+        # Check interface status
+        result = run_cmd(['iwconfig', 'wlan0'])
+        if not result:
+            return False, None
+
+        # Check if interface exists and is up
+        if "no wireless extensions" in result.stdout:
+            system_state['wifi_enabled'] = False
+            system_state['current_network'] = None
+            return False, None
+
+        system_state['wifi_enabled'] = True
+        
+        # Check if connected
+        connected = False
+        current_network = None
+        
+        for line in result.stdout.split('\n'):
+            if 'ESSID:' in line:
+                ssid = line.split('ESSID:"')[1].split('"')[0]
+                if ssid and "off/any" not in ssid.lower():
+                    connected = True
+                    current_network = {'ssid': ssid}
+                    
+            if current_network and "Quality=" in line:
+                try:
+                    quality = line.split('Quality=')[1].split(' ')[0]
+                    num, denom = quality.split('/')
+                    current_network['signal'] = int((float(num) / float(denom)) * 100)
+                except (ValueError, IndexError):
+                    current_network['signal'] = 0
+
+        if current_network:
+            current_network['security'] = 'Unknown'  # Could parse from iwlist scan
+            system_state['current_network'] = current_network
+        else:
+            system_state['current_network'] = None
+        
+        system_state['last_check_time'] = current_time
+        return connected, current_network
+       
+    except Exception as e:
+        logging.error(f"Error checking WiFi status: {str(e)}")
+        return False, None
+ 
+def get_system_metrics():
+    """Get system metrics including WiFi status"""
+    try:
+        current_time = time.time()
+       
+        # Check current WiFi status first
+        is_connected, network = check_wifi_status()
+       
+        cpu_percent = psutil.cpu_percent(interval=None)  # Use cached value
+        memory = psutil.virtual_memory()
+       
+        metrics = {
+            'timestamp': datetime.now().isoformat(),
+            'system': {
+                'cpu_percent': cpu_percent,
+                'memory_percent': memory.percent,
+                'memory_available': memory.available // (1024 * 1024),
+                'memory_total': memory.total // (1024 * 1024),
+                'wifi_enabled': system_state['wifi_enabled'],
+                'wifi_connected': is_connected,
+                'current_network': network,
+                'check_time': current_time
+            }
+        }
+       
+        return metrics
+       
+    except Exception as e:
+        logging.error(f"Error getting system metrics: {str(e)}")
+        return None
+ 
+def background_metrics_emitter():
+    """Background thread to emit metrics periodically"""
+    while True:
+        try:
+            metrics = get_system_metrics()
+            if metrics:
+                socketio.emit('metrics_update', metrics)
+        except Exception as e:
+            logging.error(f"Error in metrics emitter: {str(e)}")
+        time.sleep(system_state['metrics_interval'])
+
+@app.route('/wifi/status')
+def wifi_status():
+    """Get current WiFi status"""
+    try:
+        is_connected, network = check_wifi_status()
+        return jsonify({
+            'status': 'on' if system_state['wifi_enabled'] else 'off',
+            'connected': is_connected,
+            'current_network': network
+        })
+    except Exception as e:
+        logging.error(f"Error in wifi_status: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+ 
+@app.route('/wifi/toggle', methods=['POST'])
+def wifi_toggle():
+    """Toggle WiFi on/off"""
+    try:
+        state = request.args.get('state', '')
+        if state not in ['on', 'off']:
+            return jsonify({'error': 'Invalid state'}), 400
+        
+        if state == 'on':
+            result = run_cmd(['sudo', 'ifconfig', 'wlan0', 'up'])
+            if not result or result.returncode != 0:
+                return jsonify({'error': 'Failed to enable WiFi interface'}), 500
+            system_state['wifi_enabled'] = True
+        else:
+            disconnect_wifi()  # This will bring the interface down
+            system_state['wifi_enabled'] = False
+            system_state['current_network'] = None
+            system_state['wifi_networks'] = []
+        
+        # Emit the new state to all clients
+        socketio.emit('wifi_state_change', {
+            'status': state,
+            'current_network': system_state['current_network']
+        })
+        
+        return jsonify({
+            'status': state,
+            'current_network': system_state['current_network']
+        })
+    
+    except Exception as e:
+        logging.error(f"Error in wifi_toggle: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/wifi/scan')
+def wifi_scan():
+    """Scan for available networks"""
+    try:
+        if not system_state['wifi_enabled']:
+            return jsonify({'networks': [], 'message': 'WiFi is disabled'})
+       
+        logging.info("Starting network scan...")
+        networks = get_wifi_networks()
+       
+        if not networks:
+            # Check if we can access wireless interfaces
+            check_result = run_cmd(['iwconfig'])
+            if not check_result or "no wireless extensions" in check_result.stdout:
+                return jsonify({
+                    'networks': [],
+                    'error': 'No wireless interface found on the system'
+                }), 400
+               
+            return jsonify({
+                'networks': [],
+                'message': 'No networks found in range'
+            })
+           
+        return jsonify({
+            'networks': networks,
+            'message': f'Found {len(networks)} networks'
+        })
+       
+    except Exception as e:
+        logging.error(f"Error in wifi_scan: {str(e)}")
+        return jsonify({
+            'networks': [],
+            'error': str(e)
+        }), 500
+ 
+@app.route('/wifi/connect', methods=['POST'])
+def wifi_connect():
+    """Connect to a WiFi network"""
+    try:
+        data = request.json
+        ssid = data.get('ssid')
+        password = data.get('password')
+ 
+        if not ssid:
+            return jsonify({'error': 'SSID is required'}), 400
+ 
+        # Attempt to connect to the network
+        success = connect_to_network(ssid, password)
+        if not success:
+            return jsonify({'error': 'Failed to connect to network'}), 500
+ 
+        # Get the connection details
+        network = get_current_connection()
+        if network:
+            system_state['current_network'] = network
+           
+            # Emit connection status
+            socketio.emit('wifi_connection_change', {
+                'status': 'connected',
+                'network': network
+            })
+ 
+            return jsonify({
+                'status': 'connected',
+                'network': network
+            })
+        else:
+            return jsonify({'error': 'Failed to verify connection'}), 500
+ 
+    except Exception as e:
+        logging.error(f"Error in wifi_connect: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+ 
+@app.route('/wifi/disconnect', methods=['POST'])
+def wifi_disconnect():
+    """Disconnect from current WiFi network"""
+    try:
+        success = disconnect_wifi()
+        if success:
+            system_state['current_network'] = None
+            
+            # Emit disconnection status
+            socketio.emit('wifi_connection_change', {
+                'status': 'disconnected',
+                'network': None
+            })
+     
+            return jsonify({'status': 'disconnected'})
+        else:
+            return jsonify({'error': 'Failed to disconnect'}), 500
+            
+    except Exception as e:
+        logging.error(f"Error in wifi_disconnect: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+ 
+@app.route('/api/health')
+def health_check():
+    """Basic health check endpoint"""
+    return jsonify({'status': 'healthy', 'timestamp': datetime.now().isoformat()})
+ 
+@app.route('/api/metrics')
+def get_current_metrics():
+    """Get current system and robot metrics"""
+    try:
+        metrics = get_system_metrics()
+        if metrics:
+            return jsonify(metrics)
+        return jsonify({'error': 'Failed to get metrics'}), 500
+    except Exception as e:
+        logging.error(f"Error in get_current_metrics: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@socketio.on('connect')
+def handle_connect():
+    """Handle client connection"""
+    logging.info('Client connected')
+    socketio.emit('connection_status', {'status': 'connected'})
+ 
+@socketio.on('disconnect')
+def handle_disconnect():
+    """Handle client disconnection"""
+    logging.info('Client disconnected')
+ 
+def start_background_tasks():
+    """Start background tasks"""
+    thread = threading.Thread(target=background_metrics_emitter)
+    thread.daemon = True
+    thread.start()
+ 
+if __name__ == '__main__':
+    start_background_tasks()
+    socketio.run(app, host='0.0.0.0', port=5000, debug=True)

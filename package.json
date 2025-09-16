@@ -51,6 +51,7 @@
     "react-hook-form": "^7.45.4",
     "react-resizable-panels": "^0.0.55",
     "react-router-dom": "^6.15.0",
+    "socket.io-client": "^4.8.1",
     "sonner": "^0.7.0",
     "tailwind-merge": "^1.14.0",
     "tailwindcss-animate": "^1.0.7",

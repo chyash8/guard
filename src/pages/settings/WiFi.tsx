@@ -4,9 +4,14 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Wifi, Lock, Unlock, Loader2, Check, X } from "lucide-react";
 import { useEffect, useState } from "react";
-
-const JETSON_IP = "http://192.168.0.101:5000";
-
+import { io } from "socket.io-client";
+ 
+const BACKEND_URL = "http://192.168.0.101:5000";  // Jetson server URL
+const socket = io(BACKEND_URL, {
+  transports: ['websocket'],
+  autoConnect: false
+});
+ 
 const WiFiSettings = () => {
   const [isEnabled, setIsEnabled] = useState(false);
   const [loadingToggle, setLoadingToggle] = useState(false);
@@ -19,17 +24,40 @@ const WiFiSettings = () => {
   const [currentConnection, setCurrentConnection] = useState<any>(null);
   const [showPasswordInput, setShowPasswordInput] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-
-  // Fetch current WiFi status and connection info
+ 
+  // Set up WebSocket connection and fetch initial WiFi status
   useEffect(() => {
+    // Connect to WebSocket
+    socket.connect();
+ 
+    // Listen for WiFi state changes
+    socket.on('wifi_state_change', (data) => {
+      setIsEnabled(data.status === "on");
+      setCurrentConnection(data.current_network);
+      if (data.status === "off") {
+        setNetworks([]);
+      }
+    });
+ 
+    // Listen for connection status
+    socket.on('connect', () => {
+      console.log('Connected to WebSocket');
+      setError(null);
+    });
+ 
+    socket.on('disconnect', () => {
+      console.log('Disconnected from WebSocket');
+      setError('Lost connection to server');
+    });
+ 
+    // Fetch initial status
     const fetchStatus = async () => {
       try {
-        const res = await fetch(`${JETSON_IP}/wifi/status`);
+        const res = await fetch(`${BACKEND_URL}/wifi/status`);
         if (!res.ok) throw new Error("Failed to fetch WiFi status");
         const data = await res.json();
         setIsEnabled(data.status === "on");
-        
-        // Also fetch current connection if WiFi is on
+       
         if (data.status === "on") {
           await fetchCurrentConnection();
         }
@@ -39,13 +67,20 @@ const WiFiSettings = () => {
       }
     };
     fetchStatus();
+ 
+    // Cleanup on unmount
+    return () => {
+      socket.off('wifi_state_change');
+      socket.off('connect');
+      socket.off('disconnect');
+      socket.disconnect();
+    };
   }, []);
-
+ 
   // Fetch current connection info
   const fetchCurrentConnection = async () => {
     try {
-      // You'll need to add this endpoint to your backend
-      const res = await fetch(`${JETSON_IP}/wifi/connection`);
+      const res = await fetch(`${BACKEND_URL}/wifi/connection`);
       if (res.ok) {
         const data = await res.json();
         setCurrentConnection(data.connected ? data : null);
@@ -54,44 +89,45 @@ const WiFiSettings = () => {
       console.error("Failed to fetch connection info:", err);
     }
   };
-
+ 
   // Toggle WiFi
   const handleToggle = async (checked: boolean) => {
     setLoadingToggle(true);
     setError(null);
     try {
       const state = checked ? "on" : "off";
-      const res = await fetch(`${JETSON_IP}/wifi/toggle?state=${state}`, {
+      const res = await fetch(`${BACKEND_URL}/wifi/toggle?state=${state}`, {
         method: "POST",
       });
-      if (!res.ok) throw new Error("Failed to toggle WiFi");
-      const data = await res.json();
-      if (data.status === state) {
-        setIsEnabled(checked);
-        if (!checked) {
-          setCurrentConnection(null);
-          setNetworks([]);
-        }
+     
+      if (!res.ok) {
+        const errorData = await res.json();
+        throw new Error(errorData.error || "Failed to toggle WiFi");
       }
-    } catch (err) {
+     
+      // State update will come through WebSocket
+      setTimeout(() => {
+        setLoadingToggle(false);
+      }, 2000);
+     
+    } catch (err: any) {
       console.error("Error toggling WiFi:", err);
-      setError("Failed to toggle WiFi");
-    } finally {
+      setError(typeof err === 'string' ? err : err.message || "Failed to toggle WiFi");
       setLoadingToggle(false);
     }
   };
-
+ 
   // Scan for networks when WiFi is ON
   useEffect(() => {
     if (!isEnabled) {
       setNetworks([]);
       return;
     }
-
+ 
     const scanNetworks = async () => {
       setScanning(true);
       try {
-        const res = await fetch(`${JETSON_IP}/wifi/scan`);
+        const res = await fetch(`${BACKEND_URL}/wifi/scan`);
         if (!res.ok) throw new Error("Failed to scan networks");
         const data = await res.json();
         setNetworks(data.networks || []);
@@ -103,23 +139,23 @@ const WiFiSettings = () => {
         setScanning(false);
       }
     };
-
+ 
     scanNetworks();
     const interval = setInterval(scanNetworks, 15000); // Refresh every 15s
     return () => clearInterval(interval);
   }, [isEnabled]);
-
+ 
   // Connect to network
   const handleConnect = async (network: any) => {
     if (network.security !== "--" && !password && showPasswordInput !== network.ssid) {
       setShowPasswordInput(network.ssid);
       return;
     }
-
+ 
     setConnectingTo(network.ssid);
     setError(null);
     try {
-      const res = await fetch(`${JETSON_IP}/wifi/connect`, {
+      const res = await fetch(`${BACKEND_URL}/wifi/connect`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -129,9 +165,9 @@ const WiFiSettings = () => {
           password: network.security !== "--" ? password : null,
         }),
       });
-
+ 
       const data = await res.json();
-      
+     
       if (res.ok && data.status === "connected") {
         setCurrentConnection({
           ssid: network.ssid,
@@ -143,25 +179,25 @@ const WiFiSettings = () => {
       } else {
         throw new Error(data.error || "Failed to connect");
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error("Error connecting:", err);
       setError(`Failed to connect to ${network.ssid}: ${err.message}`);
     } finally {
       setConnectingTo(null);
     }
   };
-
+ 
   // Disconnect from current network
   const handleDisconnect = async () => {
     if (!currentConnection) return;
-    
+   
     setDisconnecting(true);
     setError(null);
     try {
-      const res = await fetch(`${JETSON_IP}/wifi/disconnect`, {
+      const res = await fetch(`${BACKEND_URL}/wifi/disconnect`, {
         method: "POST",
       });
-      
+     
       if (res.ok) {
         setCurrentConnection(null);
       } else {
@@ -174,16 +210,16 @@ const WiFiSettings = () => {
       setDisconnecting(false);
     }
   };
-
+ 
   const isCurrentNetwork = (network: any) => {
     return currentConnection && currentConnection.ssid === network.ssid;
   };
-
+ 
   return (
     <SettingsLayout>
       <div className="space-y-8">
         <h2 className="text-2xl font-bold">WiFi</h2>
-
+ 
         {error && (
           <div className="p-4 bg-red-50 border border-red-200 rounded-lg">
             <div className="flex items-center gap-2">
@@ -192,7 +228,7 @@ const WiFiSettings = () => {
             </div>
           </div>
         )}
-
+ 
         <div className="space-y-6">
           {/* WiFi Toggle */}
           <h3 className="text-xl font-bold">TURN ON & OFF</h3>
@@ -214,7 +250,7 @@ const WiFiSettings = () => {
               />
             </div>
           </div>
-
+ 
           {/* Current Connection */}
           {currentConnection && (
             <div className="space-y-2">
@@ -251,7 +287,7 @@ const WiFiSettings = () => {
               </div>
             </div>
           )}
-
+ 
           {/* Networks */}
           <h3 className="text-xl font-bold">AVAILABLE NETWORKS</h3>
           {!isEnabled && (
@@ -259,25 +295,25 @@ const WiFiSettings = () => {
               Turn on WiFi to see available networks
             </p>
           )}
-          
+         
           {isEnabled && scanning && (
             <div className="flex items-center gap-2">
               <Loader2 className="w-4 h-4 animate-spin" />
               <p>Scanning for networks...</p>
             </div>
           )}
-          
+         
           {isEnabled && !scanning && networks.length === 0 && (
             <p>No networks found.</p>
           )}
-          
+         
           {isEnabled && networks.length > 0 && (
             <div className="space-y-2">
               {networks.map((network, idx) => (
                 <div key={idx} className="space-y-2">
                   <div className={`flex justify-between items-center p-3 border rounded-lg ${
-                    isCurrentNetwork(network) 
-                      ? 'border-green-300 bg-green-50' 
+                    isCurrentNetwork(network)
+                      ? 'border-green-300 bg-green-50'
                       : 'border-gray-200'
                   }`}>
                     <div className="flex items-center gap-3">
@@ -292,8 +328,8 @@ const WiFiSettings = () => {
                         </span>
                         <p className="text-sm text-gray-500">
                           Signal: {network.signal}% • {
-                            network.security !== "--" 
-                              ? `🔒 ${network.security}` 
+                            network.security !== "--"
+                              ? `🔒 ${network.security}`
                               : "🔓 Open"
                           }
                           {isCurrentNetwork(network) && (
@@ -302,7 +338,7 @@ const WiFiSettings = () => {
                         </p>
                       </div>
                     </div>
-                    
+                   
                     {!isCurrentNetwork(network) && (
                       <Button
                         onClick={() => handleConnect(network)}
@@ -317,7 +353,7 @@ const WiFiSettings = () => {
                       </Button>
                     )}
                   </div>
-
+ 
                   {/* Password Input */}
                   {showPasswordInput === network.ssid && network.security !== "--" && (
                     <div className="ml-7 p-3 bg-gray-50 rounded-lg space-y-3">
@@ -371,5 +407,5 @@ const WiFiSettings = () => {
     </SettingsLayout>
   );
 };
-
+ 
 export default WiFiSettings;
