@@ -19,10 +19,10 @@ const SystemStatus = () => {
   };
   
   return (
-    <div className="w-[1280px] h-[800px] mx-auto bg-background">
+    <div className="w-[1280px] mx-auto bg-background">
       <Header />
       
-      <div className="p-8 h-[calc(100%-160px)] overflow-y-auto">
+      <div className="p-8">
         <h1 className="text-2xl font-bold text-center mb-8">SYSTEM STATUS</h1>
         
         <div className="grid grid-cols-2 gap-6 mb-8">

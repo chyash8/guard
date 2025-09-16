@@ -5,16 +5,22 @@ import BottomNav from "@/components/BottomNav";
 
 const Index = () => {
   return (
-    <div className="w-[1280px] h-[800px] mx-auto bg-background">
+    <div className="w-full max-w-[1280px] h-screen mx-auto bg-background flex flex-col">
+      {/* Top Header */}
       <Header />
-      
-      <div className="flex flex-col items-center justify-center h-[calc(100%-160px)] px-8">
+
+      {/* Main Content Area */}
+      <main className="flex-grow flex flex-col items-center justify-center px-8">
         <div className="w-full max-w-2xl space-y-8">
-          <TalkButton />
+          {/* Push-to-Talk Button */}
+          <TalkButton /> 
+
+          {/* Routine Progress */}
           <RoutineProgress />
         </div>
-      </div>
-      
+      </main>
+
+      {/* Bottom Navigation */}
       <BottomNav />
     </div>
   );

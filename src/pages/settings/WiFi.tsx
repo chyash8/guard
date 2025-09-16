@@ -5,79 +5,79 @@ import { Button } from "@/components/ui/button";
 import { Wifi, Lock, Unlock, Loader2, Check, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { io } from "socket.io-client";
- 
-const BACKEND_URL = "http://192.168.0.101:5000";  // Jetson server URL
+
+// Jetson server URL
+const BACKEND_URL = "http://192.168.0.101:5000";
+
+// Initialize WebSocket connection
 const socket = io(BACKEND_URL, {
-  transports: ['websocket'],
-  autoConnect: false
+  transports: ["websocket"],
+  autoConnect: false,
 });
- 
+
+type Network = {
+  ssid: string;
+  signal: number;
+  security: string;
+};
+
 const WiFiSettings = () => {
   const [isEnabled, setIsEnabled] = useState(false);
   const [loadingToggle, setLoadingToggle] = useState(false);
-  const [networks, setNetworks] = useState<any[]>([]);
+  const [networks, setNetworks] = useState<Network[]>([]);
   const [scanning, setScanning] = useState(false);
   const [connectingTo, setConnectingTo] = useState<string | null>(null);
   const [disconnecting, setDisconnecting] = useState(false);
-  const [selectedNetwork, setSelectedNetwork] = useState<string | null>(null);
   const [password, setPassword] = useState("");
-  const [currentConnection, setCurrentConnection] = useState<any>(null);
+  const [currentConnection, setCurrentConnection] = useState<Network | null>(null);
   const [showPasswordInput, setShowPasswordInput] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
- 
-  // Set up WebSocket connection and fetch initial WiFi status
+
+  // WebSocket & initial fetch setup
   useEffect(() => {
-    // Connect to WebSocket
     socket.connect();
- 
-    // Listen for WiFi state changes
-    socket.on('wifi_state_change', (data) => {
+
+    socket.on("wifi_state_change", (data) => {
       setIsEnabled(data.status === "on");
       setCurrentConnection(data.current_network);
-      if (data.status === "off") {
-        setNetworks([]);
-      }
+      if (data.status === "off") setNetworks([]);
     });
- 
-    // Listen for connection status
-    socket.on('connect', () => {
-      console.log('Connected to WebSocket');
+
+    socket.on("connect", () => {
+      console.log("WebSocket connected");
       setError(null);
     });
- 
-    socket.on('disconnect', () => {
-      console.log('Disconnected from WebSocket');
-      setError('Lost connection to server');
+
+    socket.on("disconnect", () => {
+      console.warn("WebSocket disconnected");
+      setError("Lost connection to WiFi server");
     });
- 
-    // Fetch initial status
+
     const fetchStatus = async () => {
       try {
         const res = await fetch(`${BACKEND_URL}/wifi/status`);
-        if (!res.ok) throw new Error("Failed to fetch WiFi status");
         const data = await res.json();
         setIsEnabled(data.status === "on");
-       
+
         if (data.status === "on") {
           await fetchCurrentConnection();
         }
       } catch (err) {
-        console.error("Failed to fetch WiFi status:", err);
+        console.error(err);
         setError("Failed to fetch WiFi status");
       }
     };
+
     fetchStatus();
- 
-    // Cleanup on unmount
+
     return () => {
-      socket.off('wifi_state_change');
-      socket.off('connect');
-      socket.off('disconnect');
       socket.disconnect();
+      socket.off("wifi_state_change");
+      socket.off("connect");
+      socket.off("disconnect");
     };
   }, []);
- 
-  // Fetch current connection info
+
   const fetchCurrentConnection = async () => {
     try {
       const res = await fetch(`${BACKEND_URL}/wifi/connection`);
@@ -89,8 +89,7 @@ const WiFiSettings = () => {
       console.error("Failed to fetch connection info:", err);
     }
   };
- 
-  // Toggle WiFi
+
   const handleToggle = async (checked: boolean) => {
     setLoadingToggle(true);
     setError(null);
@@ -99,127 +98,108 @@ const WiFiSettings = () => {
       const res = await fetch(`${BACKEND_URL}/wifi/toggle?state=${state}`, {
         method: "POST",
       });
-     
+
       if (!res.ok) {
         const errorData = await res.json();
-        throw new Error(errorData.error || "Failed to toggle WiFi");
+        throw new Error(errorData.error || "Toggle failed");
       }
-     
-      // State update will come through WebSocket
-      setTimeout(() => {
-        setLoadingToggle(false);
-      }, 2000);
-     
+
+      setTimeout(() => setLoadingToggle(false), 2000);
     } catch (err: any) {
-      console.error("Error toggling WiFi:", err);
-      setError(typeof err === 'string' ? err : err.message || "Failed to toggle WiFi");
+      setError(err.message || "Failed to toggle WiFi");
       setLoadingToggle(false);
     }
   };
- 
-  // Scan for networks when WiFi is ON
+
   useEffect(() => {
     if (!isEnabled) {
       setNetworks([]);
       return;
     }
- 
+
     const scanNetworks = async () => {
       setScanning(true);
       try {
         const res = await fetch(`${BACKEND_URL}/wifi/scan`);
-        if (!res.ok) throw new Error("Failed to scan networks");
         const data = await res.json();
         setNetworks(data.networks || []);
-        await fetchCurrentConnection(); // Update connection status
+        await fetchCurrentConnection();
       } catch (err) {
-        console.error("Failed to scan networks:", err);
+        console.error("Scan failed:", err);
         setError("Failed to scan networks");
       } finally {
         setScanning(false);
       }
     };
- 
+
     scanNetworks();
-    const interval = setInterval(scanNetworks, 15000); // Refresh every 15s
+    const interval = setInterval(scanNetworks, 15000);
     return () => clearInterval(interval);
   }, [isEnabled]);
- 
-  // Connect to network
-  const handleConnect = async (network: any) => {
+
+  const handleConnect = async (network: Network) => {
     if (network.security !== "--" && !password && showPasswordInput !== network.ssid) {
       setShowPasswordInput(network.ssid);
       return;
     }
- 
+
     setConnectingTo(network.ssid);
     setError(null);
     try {
       const res = await fetch(`${BACKEND_URL}/wifi/connect`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           ssid: network.ssid,
           password: network.security !== "--" ? password : null,
         }),
       });
- 
+
       const data = await res.json();
-     
       if (res.ok && data.status === "connected") {
         setCurrentConnection({
           ssid: network.ssid,
           signal: network.signal,
-          security: network.security
+          security: network.security,
         });
         setPassword("");
         setShowPasswordInput(null);
       } else {
-        throw new Error(data.error || "Failed to connect");
+        throw new Error(data.error || "Connect failed");
       }
     } catch (err: any) {
-      console.error("Error connecting:", err);
       setError(`Failed to connect to ${network.ssid}: ${err.message}`);
     } finally {
       setConnectingTo(null);
     }
   };
- 
-  // Disconnect from current network
+
   const handleDisconnect = async () => {
     if (!currentConnection) return;
-   
     setDisconnecting(true);
     setError(null);
     try {
-      const res = await fetch(`${BACKEND_URL}/wifi/disconnect`, {
-        method: "POST",
-      });
-     
+      const res = await fetch(`${BACKEND_URL}/wifi/disconnect`, { method: "POST" });
       if (res.ok) {
         setCurrentConnection(null);
       } else {
-        throw new Error("Failed to disconnect");
+        throw new Error("Disconnect failed");
       }
     } catch (err) {
-      console.error("Error disconnecting:", err);
-      setError("Failed to disconnect from network");
+      setError("Failed to disconnect");
     } finally {
       setDisconnecting(false);
     }
   };
- 
-  const isCurrentNetwork = (network: any) => {
-    return currentConnection && currentConnection.ssid === network.ssid;
-  };
- 
+
+  const isCurrentNetwork = (network: Network) =>
+    currentConnection && currentConnection.ssid === network.ssid;
+
   return (
     <SettingsLayout>
       <div className="space-y-8">
-        <h2 className="text-2xl font-bold">WiFi</h2>
- 
+        <h2 className="text-2xl font-bold">WiFi Settings</h2>
+
         {error && (
           <div className="p-4 bg-red-50 border border-red-200 rounded-lg">
             <div className="flex items-center gap-2">
@@ -228,18 +208,18 @@ const WiFiSettings = () => {
             </div>
           </div>
         )}
- 
+
         <div className="space-y-6">
-          {/* WiFi Toggle */}
-          <h3 className="text-xl font-bold">TURN ON & OFF</h3>
-          <div className="p-6 border border-border rounded-lg">
-            <div className="flex items-center justify-between">
+          {/* Toggle */}
+          <h3 className="text-xl font-bold">WiFi Power</h3>
+          <div className="p-6 border rounded-lg">
+            <div className="flex justify-between items-center">
               <div className="flex items-center gap-3">
                 <Wifi className="w-6 h-6" />
                 <div>
-                  <h4 className="font-bold">WiFi</h4>
+                  <p className="font-bold">WiFi</p>
                   <p className="text-sm text-muted-foreground">
-                    TURN ON AND OFF WiFi
+                    Enable or disable WiFi
                   </p>
                 </div>
               </div>
@@ -250,23 +230,23 @@ const WiFiSettings = () => {
               />
             </div>
           </div>
- 
+
           {/* Current Connection */}
           {currentConnection && (
             <div className="space-y-2">
-              <h3 className="text-xl font-bold">CURRENT CONNECTION</h3>
+              <h3 className="text-xl font-bold">Connected</h3>
               <div className="p-4 bg-green-50 border border-green-200 rounded-lg">
-                <div className="flex items-center justify-between">
+                <div className="flex justify-between items-center">
                   <div className="flex items-center gap-3">
-                    <Check className="w-5 h-5 text-green-600" />
+                    <Check className="text-green-600 w-5 h-5" />
                     <div>
                       <h4 className="font-semibold text-green-800">
                         {currentConnection.ssid}
                       </h4>
                       <p className="text-sm text-green-600">
-                        Connected • Signal: {currentConnection.signal}%
+                        Signal: {currentConnection.signal}%{" "}
                         {currentConnection.security !== "--" && (
-                          <span className="ml-2">🔒 {currentConnection.security}</span>
+                          <span>• 🔒 {currentConnection.security}</span>
                         )}
                       </p>
                     </div>
@@ -277,45 +257,35 @@ const WiFiSettings = () => {
                     variant="outline"
                     size="sm"
                   >
-                    {disconnecting ? (
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                    ) : (
-                      "Disconnect"
-                    )}
+                    {disconnecting ? <Loader2 className="w-4 h-4 animate-spin" /> : "Disconnect"}
                   </Button>
                 </div>
               </div>
             </div>
           )}
- 
-          {/* Networks */}
-          <h3 className="text-xl font-bold">AVAILABLE NETWORKS</h3>
-          {!isEnabled && (
-            <p className="text-muted-foreground">
-              Turn on WiFi to see available networks
-            </p>
-          )}
-         
-          {isEnabled && scanning && (
+
+          {/* Network List */}
+          <h3 className="text-xl font-bold">Available Networks</h3>
+          {!isEnabled ? (
+            <p className="text-muted-foreground">Enable WiFi to scan networks</p>
+          ) : scanning ? (
             <div className="flex items-center gap-2">
               <Loader2 className="w-4 h-4 animate-spin" />
-              <p>Scanning for networks...</p>
+              <p>Scanning...</p>
             </div>
-          )}
-         
-          {isEnabled && !scanning && networks.length === 0 && (
-            <p>No networks found.</p>
-          )}
-         
-          {isEnabled && networks.length > 0 && (
+          ) : networks.length === 0 ? (
+            <p>No networks found</p>
+          ) : (
             <div className="space-y-2">
               {networks.map((network, idx) => (
                 <div key={idx} className="space-y-2">
-                  <div className={`flex justify-between items-center p-3 border rounded-lg ${
-                    isCurrentNetwork(network)
-                      ? 'border-green-300 bg-green-50'
-                      : 'border-gray-200'
-                  }`}>
+                  <div
+                    className={`flex justify-between items-center p-3 border rounded-lg ${
+                      isCurrentNetwork(network)
+                        ? "border-green-300 bg-green-50"
+                        : "border-gray-200"
+                    }`}
+                  >
                     <div className="flex items-center gap-3">
                       {network.security !== "--" ? (
                         <Lock className="w-4 h-4 text-gray-500" />
@@ -327,18 +297,16 @@ const WiFiSettings = () => {
                           {network.ssid || "(Hidden SSID)"}
                         </span>
                         <p className="text-sm text-gray-500">
-                          Signal: {network.signal}% • {
-                            network.security !== "--"
-                              ? `🔒 ${network.security}`
-                              : "🔓 Open"
-                          }
+                          Signal: {network.signal}% •{" "}
+                          {network.security !== "--"
+                            ? `🔒 ${network.security}`
+                            : "🔓 Open"}
                           {isCurrentNetwork(network) && (
                             <span className="ml-2 text-green-600 font-medium">Connected</span>
                           )}
                         </p>
                       </div>
                     </div>
-                   
                     {!isCurrentNetwork(network) && (
                       <Button
                         onClick={() => handleConnect(network)}
@@ -353,7 +321,7 @@ const WiFiSettings = () => {
                       </Button>
                     )}
                   </div>
- 
+
                   {/* Password Input */}
                   {showPasswordInput === network.ssid && network.security !== "--" && (
                     <div className="ml-7 p-3 bg-gray-50 rounded-lg space-y-3">
@@ -367,7 +335,7 @@ const WiFiSettings = () => {
                           onChange={(e) => setPassword(e.target.value)}
                           placeholder="Enter network password"
                           onKeyPress={(e) => {
-                            if (e.key === 'Enter') {
+                            if (e.key === "Enter") {
                               handleConnect(network);
                             }
                           }}
@@ -407,5 +375,5 @@ const WiFiSettings = () => {
     </SettingsLayout>
   );
 };
- 
+
 export default WiFiSettings;

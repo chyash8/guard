@@ -3,3 +3,5 @@ uvicorn
 screen-brightness-control
 bleak
 pyalsaaudio
+pydantic
+python-socketio
