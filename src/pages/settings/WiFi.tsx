@@ -38,9 +38,18 @@ const WiFiSettings = () => {
     socket.connect();
 
     socket.on("wifi_state_change", (data) => {
-      setIsEnabled(data.status === "on");
-      setCurrentConnection(data.current_network);
-      if (data.status === "off") setNetworks([]);
+      const isWifiOn = data.status === "on";
+      setIsEnabled(isWifiOn);
+      
+      // Clear networks and connection if WiFi is off
+      if (!isWifiOn) {
+        setNetworks([]);
+        setCurrentConnection(null);
+        setShowPasswordInput(null);
+        setPassword("");
+      } else {
+        setCurrentConnection(data.current_network);
+      }
     });
 
     socket.on("connect", () => {
@@ -95,8 +104,10 @@ const WiFiSettings = () => {
     setError(null);
     try {
       const state = checked ? "on" : "off";
-      const res = await fetch(`${BACKEND_URL}/wifi/toggle?state=${state}`, {
+      const res = await fetch(`${BACKEND_URL}/wifi/toggle`, {
         method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ state })
       });
 
       if (!res.ok) {
@@ -114,6 +125,7 @@ const WiFiSettings = () => {
   useEffect(() => {
     if (!isEnabled) {
       setNetworks([]);
+      setCurrentConnection(null);
       return;
     }
 
@@ -122,8 +134,20 @@ const WiFiSettings = () => {
       try {
         const res = await fetch(`${BACKEND_URL}/wifi/scan`);
         const data = await res.json();
+        
+        // If WiFi is off, clear networks and return
+        if (data.status === "off") {
+          setNetworks([]);
+          setCurrentConnection(null);
+          setIsEnabled(false);
+          return;
+        }
+        
         setNetworks(data.networks || []);
-        await fetchCurrentConnection();
+        // Only fetch connection if we got networks back
+        if (data.networks && data.networks.length > 0) {
+          await fetchCurrentConnection();
+        }
       } catch (err) {
         console.error("Scan failed:", err);
         setError("Failed to scan networks");

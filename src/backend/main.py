@@ -197,6 +197,11 @@ class WifiConnectRequest(BaseModel):
 @fastapi_app.get("/wifi/scan")
 def wifi_scan():
     try:
+        # Check WiFi status first
+        status = wifi_status()
+        if status["status"] == "off":
+            return {"networks": [], "status": "off"}
+
         # Get detailed network info including security
         result = subprocess.run(
             ["nmcli", "-t", "-f", "SSID,SIGNAL,SECURITY", "dev", "wifi", "list"],
@@ -227,7 +232,7 @@ def wifi_scan():
                             network["connected"] = True
                         networks.append(network)
                         
-        return {"networks": networks}
+        return {"networks": networks, "status": "on"}
     except Exception as e:
         print(f"Scan error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -300,16 +305,46 @@ def current_wifi():
 @fastapi_app.get("/wifi/status")
 def wifi_status():
     try:
+        # First check if the wifi hardware is blocked
+        rfkill = subprocess.run(
+            ["rfkill", "list", "wifi"],
+            capture_output=True,
+            text=True
+        )
+        
+        if "Soft blocked: yes" in rfkill.stdout:
+            return {"status": "off", "reason": "blocked"}
+            
+        # Then check nmcli status
         result = subprocess.run(
             ["nmcli", "radio", "wifi"],
             capture_output=True,
-            text=True,
-            check=True
+            text=True
         )
-        status = result.stdout.strip().lower()
-        return {"status": "on" if status == "enabled" else "off"}
+        
+        if result.returncode == 0:
+            status = result.stdout.strip().lower()
+            return {"status": "on" if status == "enabled" else "off"}
+            
+        # If nmcli failed, try checking device status directly
+        dev_status = subprocess.run(
+            ["nmcli", "device", "status"],
+            capture_output=True,
+            text=True
+        )
+        
+        if dev_status.returncode == 0:
+            # Look for any wifi device that's not unavailable
+            for line in dev_status.stdout.split('\n'):
+                if 'wifi' in line.lower() and 'unavailable' not in line.lower():
+                    return {"status": "on"}
+                    
+        return {"status": "off", "reason": "unavailable"}
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Error checking WiFi status: {str(e)}")
+        # Don't raise an exception, just return off status
+        return {"status": "off", "reason": str(e)}
 
 @fastapi_app.post("/wifi/toggle")
 async def toggle_wifi(req: ToggleRequest):
@@ -317,10 +352,30 @@ async def toggle_wifi(req: ToggleRequest):
         if req.state not in ["on", "off"]:
             raise HTTPException(status_code=400, detail="Invalid state. Use 'on' or 'off'")
         
-        subprocess.run(["nmcli", "radio", "wifi", req.state], check=True)
-        await asyncio.sleep(1)  # Give device time to update
+        # First check current status
+        current_status = wifi_status()
+        if current_status["status"] == "on" and req.state == "on":
+            return {"status": "on", "message": "WiFi is already on"}
+        if current_status["status"] == "off" and req.state == "off":
+            return {"status": "off", "message": "WiFi is already off"}
+            
+        # Execute the toggle command
+        result = subprocess.run(
+            ["nmcli", "radio", "wifi", req.state],
+            capture_output=True,
+            text=True
+        )
         
-        # Get the updated status and current connection
+        if result.returncode != 0:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to toggle WiFi: {result.stderr}"
+            )
+        
+        # Give the system time to update the WiFi state
+        await asyncio.sleep(2)
+        
+        # Get the updated status
         status = wifi_status()
         current = None
         if status["status"] == "on":
@@ -332,9 +387,18 @@ async def toggle_wifi(req: ToggleRequest):
             'current_network': current
         })
         
-        return {"status": req.state}
+        return {"status": status["status"]}
+            
     except subprocess.CalledProcessError as e:
-        raise HTTPException(status_code=500, detail=f"Failed to toggle Wi-Fi: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to toggle WiFi: {str(e)}"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected error while toggling WiFi: {str(e)}"
+        )
 
 @fastapi_app.post("/wifi/connect")
 async def connect_wifi(req: WifiConnectRequest):
