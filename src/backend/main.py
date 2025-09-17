@@ -95,30 +95,112 @@ async def set_volume(request: VolumeRequest):
 
 def bluetooth_on():
     try:
+        # First unblock using rfkill
         subprocess.run(["rfkill", "unblock", "bluetooth"], check=True)
+        
+        # Start the bluetooth service
         subprocess.run(["systemctl", "start", "bluetooth"], check=True)
+        time.sleep(2)  # Give time for the service to start
+        
+        # Turn on using bluetoothctl
+        subprocess.run(["bluetoothctl", "power", "on"], check=True)
+        time.sleep(1)  # Give time for power on
+        
+        # Verify the status
+        status = bluetooth_status()
+        if status != "on":
+            raise Exception("Failed to turn Bluetooth on")
+            
         return {"success": True}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 def bluetooth_off():
     try:
+        # First try to disconnect any connected devices
+        try:
+            result = subprocess.run(["bluetoothctl", "info"], capture_output=True, text=True)
+            if "Connected: yes" in result.stdout:
+                for line in result.stdout.splitlines():
+                    if line.strip().startswith("Device "):
+                        device_address = line.strip().split()[1]
+                        subprocess.run(["bluetoothctl", "disconnect", device_address], 
+                                    check=True, capture_output=True)
+                time.sleep(1)  # Give time for disconnect
+        except:
+            pass  # Continue even if disconnect fails
+            
+        # Turn off using bluetoothctl
+        subprocess.run(["bluetoothctl", "power", "off"], check=True)
+        time.sleep(1)  # Give time for power off
+        
+        # Stop the bluetooth service
         subprocess.run(["systemctl", "stop", "bluetooth"], check=True)
+        
+        # Block using rfkill
         subprocess.run(["rfkill", "block", "bluetooth"], check=True)
+        time.sleep(1)  # Give time for blocking
+        
+        # Verify the status
+        status = bluetooth_status()
+        if status != "off":
+            raise Exception("Failed to turn Bluetooth off")
+            
         return {"success": True}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 def bluetooth_status():
     try:
-        result = subprocess.run(["rfkill", "list", "bluetooth"], capture_output=True, text=True)
-        if "Soft blocked: yes" in result.stdout:
+        # First check bluetooth service status
+        service_status = subprocess.run(
+            ["systemctl", "is-active", "bluetooth"],
+            capture_output=True,
+            text=True
+        ).stdout.strip()
+        
+        print(f"Bluetooth service status: {service_status}")
+        
+        if service_status != "active":
+            print("Bluetooth service is not active")
             return "off"
-        elif "Soft blocked: no" in result.stdout:
+
+        # Then check rfkill status
+        rfkill_result = subprocess.run(
+            ["rfkill", "list", "bluetooth"],
+            capture_output=True,
+            text=True
+        )
+        print(f"rfkill output: {rfkill_result.stdout}")
+        
+        if "Soft blocked: yes" in rfkill_result.stdout:
+            print("Bluetooth is soft blocked")
+            return "off"
+            
+        # Finally check bluetoothctl power status
+        power_result = subprocess.run(
+            ["bluetoothctl", "show"],
+            capture_output=True,
+            text=True
+        )
+        print(f"bluetoothctl show output: {power_result.stdout}")
+        
+        if "Powered: yes" in power_result.stdout:
+            print("Bluetooth is powered on")
             return "on"
-        else:
-            return "unknown"
-    except:
+        elif "Powered: no" in power_result.stdout:
+            print("Bluetooth is powered off")
+            return "off"
+            
+        # If we can't determine the status definitively, check if adapter exists
+        if "Controller" in power_result.stdout:
+            print("Bluetooth controller found, assuming on")
+            return "on"
+            
+        print("Unable to determine bluetooth status definitively")
+        return "unknown"
+    except Exception as e:
+        print(f"Error checking bluetooth status: {e}")
         return "unknown"
 
 # Store discovered devices
@@ -250,51 +332,90 @@ def get_status():
         if status == "off":
             return {"status": "off", "connected": False}
             
-        # Check for connected devices using bluetoothctl
+        # Check for connected devices using bluetoothctl info
         result = subprocess.run(
             ["bluetoothctl", "info"],
             capture_output=True,
-            text=True
+            text=True,
+            check=True
         )
         
         connected_device = None
         device_name = None
+        is_connected = False
         
         # Parse the bluetoothctl info output
-        if "Connected: yes" in result.stdout:
-            for line in result.stdout.splitlines():
-                if line.strip().startswith("Device "):
-                    connected_device = line.split()[1]
-                elif line.strip().startswith("Name: "):
-                    device_name = line.split(": ", 1)[1]
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.startswith("Device "):
+                connected_device = line.split()[1]
+            elif line.startswith("Name: "):
+                device_name = line.split(": ", 1)[1]
+            elif line == "Connected: yes":
+                is_connected = True
+            elif line == "Connected: no":
+                is_connected = False
+
+        # Only consider device connected if both device is found AND Connected: yes
+        if not is_connected:
+            connected_device = None
+            device_name = None
                     
+        # Print debug info
+        print(f"Bluetooth status: Power={status}, Connected={is_connected}, Device={connected_device}, Name={device_name}")
+            
         return {
             "status": status,
-            "connected": connected_device is not None,
-            "device": connected_device,
-            "device_name": device_name
+            "connected": is_connected,
+            "device": connected_device if is_connected else None,
+            "device_name": device_name if is_connected else None
         }
+    except subprocess.CalledProcessError as e:
+        print(f"Error running bluetoothctl info: {e}")
+        return {"status": bluetooth_status(), "connected": False}
     except Exception as e:
         print(f"Error getting Bluetooth status: {e}")
         return {"status": bluetooth_status(), "connected": False}
 
 @fastapi_app.post("/bluetooth/toggle")
-def toggle_bluetooth(req: ToggleRequest):
+async def toggle_bluetooth(req: ToggleRequest):
+    if req.state not in ["on", "off"]:
+        raise HTTPException(status_code=400, detail="Invalid state. Use 'on' or 'off'")
+    
+    # Check current status first
+    current = bluetooth_status()
+    if current == req.state:
+        return {"status": req.state, "message": f"Bluetooth is already {req.state}"}
+        
+    # Perform the toggle
     if req.state == "on":
         result = bluetooth_on()
-    elif req.state == "off":
-        result = bluetooth_off()
     else:
-        raise HTTPException(status_code=400, detail="Invalid state")
+        result = bluetooth_off()
+        
     if not result["success"]:
         raise HTTPException(status_code=500, detail=result["error"])
-    return {"status": req.state}
+        
+    # Verify the new status
+    await asyncio.sleep(2)  # Give time for the system to update
+    new_status = bluetooth_status()
+    
+    if new_status != req.state:
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to set Bluetooth {req.state}. Current status: {new_status}"
+        )
+    
+    # Clear discovered devices when turning off
+    if req.state == "off":
+        global discovered_devices
+        discovered_devices = {}
 
 @fastapi_app.get("/bluetooth/scan")
-async def scan():
-    # Check if we need to force a scan
+async def scan(force: bool = False):
+    # Use the force parameter or check scan interval
     current_time = time.time()
-    force_scan = (current_time - last_scan_time) >= SCAN_INTERVAL
+    force_scan = force or (current_time - last_scan_time) >= SCAN_INTERVAL
     devices = await scan_devices(timeout=5, force_scan=force_scan)
     return {"devices": devices}
 
@@ -304,6 +425,52 @@ async def connect(req: ConnectRequest):
     if result["status"] != "connected":
         raise HTTPException(status_code=500, detail=result.get("error"))
     return result
+
+@fastapi_app.post("/bluetooth/disconnect")
+async def disconnect_bluetooth():
+    try:
+        # Stop scanning before disconnect
+        subprocess.run(["bluetoothctl", "scan", "off"], capture_output=True)
+        await asyncio.sleep(1)
+
+        # Get the currently connected device info
+        result = subprocess.run(["bluetoothctl", "info"], capture_output=True, text=True)
+        
+        device_address = None
+        device_name = None
+        if "Connected: yes" in result.stdout:
+            # Extract device information from the info output
+            for line in result.stdout.splitlines():
+                if line.strip().startswith("Device "):
+                    device_address = line.strip().split()[1]
+                elif line.strip().startswith("Name: "):
+                    device_name = line.split(": ", 1)[1]
+            
+            if device_address:
+                # Disconnect the device
+                subprocess.run(["bluetoothctl", "disconnect", device_address], check=True)
+                await asyncio.sleep(1)  # Give time for disconnect to complete
+                
+                # Notify all connected clients about the Bluetooth state change
+                status_data = {
+                    "status": "on",  # Bluetooth is still on, just disconnected
+                    "connected": False,
+                    "device": None,
+                    "device_name": None,
+                    "last_device": {  # Include info about the device that was disconnected
+                        "address": device_address,
+                        "name": device_name
+                    }
+                }
+                await sio.emit('bluetooth_state_change', status_data)
+                return {"status": "disconnected"}
+        
+        return {"status": "not_connected"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Resume scanning after disconnect
+        subprocess.run(["bluetoothctl", "scan", "on"], capture_output=True)
 
 # --------------------------
 # Brightness
@@ -660,8 +827,8 @@ async def voice_chat_status():
 @sio.event
 async def connect(sid, environ):
     print(f"Socket.IO client connected: {sid}")
-    # Get current WiFi status
     try:
+        # Get current WiFi status
         wifi_state = wifi_status()
         current = None
         if wifi_state["status"] == "on":
@@ -670,8 +837,16 @@ async def connect(sid, environ):
             'status': wifi_state["status"],
             'current_network': current
         }, to=sid)
+        
+        # Get current Bluetooth status and emit to the new client
+        bt_status = get_status()
+        print(f"Sending initial Bluetooth status to client {sid}:", bt_status)
+        await sio.emit('bluetooth_state_change', bt_status, to=sid)
+        
+        # Also broadcast current status to all clients to ensure sync
+        await sio.emit('bluetooth_state_change', bt_status)
     except Exception as e:
-        print(f"Error sending initial WiFi state: {e}")
+        print(f"Error sending initial states: {e}")
 
 @sio.event
 async def disconnect(sid):

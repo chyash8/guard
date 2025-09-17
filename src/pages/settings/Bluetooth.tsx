@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import SettingsLayout from "@/components/SettingsLayout";
 import { Switch } from "@/components/ui/switch";
 import { Bluetooth as BluetoothIcon, Plug } from "lucide-react";
+import { socket } from "@/lib/socket";
 
 const JETSON_IP = window.location.hostname === 'localhost' ? '192.168.0.101' : window.location.hostname;
 const API_BASE = `http://${JETSON_IP}:5000/bluetooth`;
@@ -14,12 +15,13 @@ interface Device {
 
 const Bluetooth = () => {
   const [isEnabled, setIsEnabled] = useState<boolean>(false);
-  const [loadingToggle, setLoadingToggle] = useState<boolean>(false);
+  const [loadingToggle, setLoadingToggle] = useState<boolean>(true);  // Start as loading
   const [devices, setDevices] = useState<Device[]>([]);
   const [scanning, setScanning] = useState<boolean>(false);
   const [connectingDevice, setConnectingDevice] = useState<string | null>(null);
   const [isConnected, setIsConnected] = useState<boolean>(false);
   const [connectedDevice, setConnectedDevice] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   // 1️⃣ Fetch current Bluetooth status (initial + every 5s)
   useEffect(() => {
@@ -30,7 +32,7 @@ const Bluetooth = () => {
       if (!isSubscribed) return;
 
       try {
-        console.log("Fetching Bluetooth status...");
+        setError(null);
         const res = await fetch(`${API_BASE}/status`);
         
         if (!res.ok) {
@@ -38,13 +40,18 @@ const Bluetooth = () => {
         }
         
         const data = await res.json();
-        console.log("Status response:", data);
+        console.log("Bluetooth status response:", data);
         
         if (isSubscribed) {
-          setIsEnabled(data.status === "on");
-          setIsConnected(data.connected);
-          if (data.connected) {
-            // Find the connected device in the current devices list or create a new entry
+          // Update power state
+          const bluetoothOn = data.status === "on";
+          setIsEnabled(bluetoothOn);
+          
+          // Update connection state
+          setIsConnected(data.connected || false);
+          
+          if (data.connected && data.device) {
+            // Update connected device info
             const connectedDeviceInfo = {
               name: data.device_name || "Connected Device",
               address: data.device,
@@ -52,34 +59,74 @@ const Bluetooth = () => {
             };
             setConnectedDevice(data.device);
             
-            // Update devices list to include connected device if not present
+            // Ensure connected device is in the list and update its info
             setDevices(prevDevices => {
-              const deviceExists = prevDevices.some(d => d.address === data.device);
-              if (!deviceExists && data.device) {
-                return [...prevDevices, connectedDeviceInfo];
+              const existingDeviceIndex = prevDevices.findIndex(d => d.address === data.device);
+              if (existingDeviceIndex === -1) {
+                // Add new device at the beginning
+                return [connectedDeviceInfo, ...prevDevices];
+              } else {
+                // Update existing device info and move to top
+                const updatedDevices = [...prevDevices];
+                updatedDevices.splice(existingDeviceIndex, 1);
+                return [
+                  {
+                    ...prevDevices[existingDeviceIndex],
+                    name: data.device_name || prevDevices[existingDeviceIndex].name,
+                    type: prevDevices[existingDeviceIndex].type || "Connected Device"
+                  },
+                  ...updatedDevices
+                ];
               }
-              return prevDevices;
             });
+            
+            // If Bluetooth is on, trigger a scan to update device info
+            if (bluetoothOn) {
+              // Force scan to ensure we have latest device info
+              const scanDevices = async () => {
+                try {
+                  const res = await fetch(`${API_BASE}/scan?force=true`);
+                  const data = await res.json();
+                  setDevices(prevDevices => {
+                    const newDevices = data.devices || [];
+                    // Keep our connected device at the top
+                    const connectedDevice = prevDevices.find(d => d.address === data.device);
+                    if (connectedDevice && !newDevices.some(d => d.address === data.device)) {
+                      newDevices.unshift(connectedDevice);
+                    }
+                    return newDevices;
+                  });
+                } catch (err) {
+                  console.error("Failed to scan for devices:", err);
+                }
+              };
+              if (!scanning) {
+                scanDevices();
+              }
+            }
           } else {
             setConnectedDevice(null);
           }
         }
       } catch (err) {
         console.error("Failed to fetch Bluetooth status:", err);
+        setError("Failed to get Bluetooth status");
         
         // Retry more frequently on error, up to 3 times
         if (retryCount < 3 && isSubscribed) {
           console.log(`Retrying status fetch in 2s (attempt ${retryCount + 1})...`);
           retryTimeout = setTimeout(() => fetchStatus(retryCount + 1), 2000);
         }
+      } finally {
+        setLoadingToggle(false);
       }
     };
 
     // Initial fetch
     fetchStatus();
 
-    // Regular polling
-    const interval = setInterval(fetchStatus, 5000);
+    // Regular polling (less frequent)
+    const interval = setInterval(fetchStatus, 10000);
 
     // Cleanup
     return () => {
@@ -87,68 +134,143 @@ const Bluetooth = () => {
       clearInterval(interval);
       if (retryTimeout) clearTimeout(retryTimeout);
     };
-  }, []);
+  }, [scanning]);
 
-  // 2️⃣ Toggle Bluetooth
-  const handleToggle = async (checked: boolean) => {
-    setLoadingToggle(true);
-    const state = checked ? "on" : "off";
-    
-    // Function to attempt toggle with retry
-    const attemptToggle = async (retryCount = 0): Promise<boolean> => {
-      try {
-        console.log(`Attempting to toggle Bluetooth ${state} (attempt ${retryCount + 1})`);
-        
-        const res = await fetch(`${API_BASE}/toggle`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ state }),
-        });
+  // Listen for Bluetooth state changes from Socket.IO
+  useEffect(() => {
+    if (!socket) return;
 
-        if (!res.ok) {
-          throw new Error(`HTTP error! status: ${res.status}`);
+    const handleBluetoothStateChange = async (data: any) => {
+      console.log("Bluetooth state change:", data);
+      
+      // Update Bluetooth power state
+      setIsEnabled(data.status === "on");
+      
+      // Update connection state
+      const isDeviceConnected = data.connected && data.device;
+      setIsConnected(isDeviceConnected);
+      setConnectedDevice(isDeviceConnected ? data.device : null);
+      
+      // Always do a fresh scan after state change
+      if (data.status === "on" && !scanning) {
+        try {
+          const res = await fetch(`${API_BASE}/scan?force=true`);
+          const scanData = await res.json();
+          setDevices(prevDevices => {
+            const newDevices = scanData.devices || [];
+            
+            // If we have a connected device, ensure it's at the top
+            if (isDeviceConnected) {
+              const connectedDeviceInfo = {
+                name: data.device_name || "Connected Device",
+                address: data.device,
+                type: "Connected Device"
+              };
+              
+              // Remove any existing entry for this device
+              const filteredDevices = newDevices.filter(d => d.address !== data.device);
+              
+              // Add the connected device at the top
+              return [connectedDeviceInfo, ...filteredDevices];
+            }
+            
+            return newDevices;
+          });
+        } catch (err) {
+          console.error("Failed to scan after state change:", err);
+          setError("Failed to update device list");
         }
-        
-        const data = await res.json();
-        console.log("Toggle response:", data);
-
-        if (data.status === state) {
-          console.log(`Successfully toggled Bluetooth ${state}`);
-          return true;
-        } else {
-          console.error(`Toggle failed: Expected ${state}, got ${data.status}`);
-          if (data.error) {
-            alert(`Failed to toggle Bluetooth: ${data.error}`);
-          }
-          return false;
-        }
-      } catch (err) {
-        console.error(`Toggle attempt ${retryCount + 1} failed:`, err);
-        if (retryCount < 2) { // Try up to 3 times
-          console.log("Retrying toggle...");
-          await new Promise(resolve => setTimeout(resolve, 2000)); // Wait 2s before retry
-          return attemptToggle(retryCount + 1);
-        }
-        alert(`Failed to toggle Bluetooth. Please try again in a few moments. Error: ${err.message}`);
-        return false;
+      } else if (!data.status === "on") {
+        // Clear device list if Bluetooth is off
+        setDevices([]);
       }
     };
 
+    socket.on("bluetooth_state_change", handleBluetoothStateChange);
+
+    return () => {
+      socket.off("bluetooth_state_change", handleBluetoothStateChange);
+    };
+  }, [scanning]);
+
+  // 2️⃣ Toggle Bluetooth
+  const handleToggle = async (checked: boolean) => {
+    if (loadingToggle) return; // Prevent multiple toggles while processing
+    
+    setLoadingToggle(true);
+    const state = checked ? "on" : "off";
+    
+    const toggleWithRetry = async (attempts = 3): Promise<boolean> => {
+      for (let i = 0; i < attempts; i++) {
+        try {
+          console.log(`Attempting to toggle Bluetooth ${state} (attempt ${i + 1}/${attempts})`);
+          
+          const res = await fetch(`${API_BASE}/toggle`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ state }),
+          });
+
+          const data = await res.json();
+          
+          if (!res.ok) {
+            throw new Error(data.detail || `HTTP error! status: ${res.status}`);
+          }
+
+          console.log("Toggle response:", data);
+          
+          // If we get here, the toggle was successful
+          return true;
+          
+        } catch (err) {
+          console.error(`Toggle attempt ${i + 1} failed:`, err);
+          if (i < attempts - 1) {
+            console.log(`Waiting before retry ${i + 2}...`);
+            await new Promise(resolve => setTimeout(resolve, 2000));
+          } else {
+            // Last attempt failed
+            alert(`Failed to toggle Bluetooth. Please try again in a few moments.\nError: ${err.message}`);
+            return false;
+          }
+        }
+      }
+      return false;
+    };
+
     try {
-      const success = await attemptToggle();
+      const success = await toggleWithRetry();
       if (success) {
         setIsEnabled(checked);
         if (!checked) {
+          // Clear connection state when turning off
           setIsConnected(false);
           setConnectedDevice(null);
           setDevices([]);
         }
       } else {
-        // Reset the switch to its previous state
+        // Reset switch state on failure
         setIsEnabled(!checked);
       }
     } finally {
       setLoadingToggle(false);
+      
+      // If turning on, start a fresh scan after a short delay
+      if (checked) {
+        setTimeout(() => {
+          if (isEnabled) {
+            const scanDevices = async () => {
+              try {
+                const res = await fetch(`${API_BASE}/scan`);
+                const data = await res.json();
+                setDevices(data.devices || []);
+              } catch (err) {
+                console.error("Failed to scan after toggle:", err);
+              }
+            };
+            scanDevices();
+          }
+        }, 3000);
+      }
     }
   };
 
@@ -165,28 +287,29 @@ const Bluetooth = () => {
         const res = await fetch(`${API_BASE}/scan`);
         const data = await res.json();
         setDevices(prevDevices => {
-          // Keep connected device in the list
+          // Keep connected device at top if exists
           const newDevices = data.devices || [];
           if (connectedDevice) {
             const connected = prevDevices.find(d => d.address === connectedDevice);
             if (connected && !newDevices.some(d => d.address === connectedDevice)) {
-              newDevices.push(connected);
+              newDevices.unshift(connected);
             }
           }
           return newDevices;
         });
       } catch (err) {
         console.error("Failed to scan devices:", err);
+        setError("Failed to scan for devices");
       } finally {
         setScanning(false);
       }
     };
 
-    // Initial scan
+    // Initial scan when Bluetooth is enabled
     scanDevices();
     
-    // Scan every 15 seconds
-    const interval = setInterval(scanDevices, 15000);
+    // Scan every 30 seconds (reduced frequency, since we have manual scan now)
+    const interval = setInterval(scanDevices, 30000);
     
     return () => clearInterval(interval);
   }, [isEnabled, connectingDevice, connectedDevice]);
@@ -218,7 +341,10 @@ const Bluetooth = () => {
       if (data.status === "connected") {
         setIsConnected(true);
         setConnectedDevice(address);
-        alert(`✅ Successfully connected to ${deviceName}`);
+        // Sort devices to show connected device at top
+        setDevices(prev => [...prev].sort((a, b) => 
+          a.address === address ? -1 : b.address === address ? 1 : 0
+        ));
       } else {
         const errorMsg = data.error || "Unknown error occurred";
         alert(`❌ Connection failed:\n${errorMsg}\n\nTips:\n1. Make sure device is in pairing mode\n2. Try turning device off and on\n3. Move closer to the device`);
@@ -237,16 +363,57 @@ const Bluetooth = () => {
         <h2 className="text-2xl font-bold">BLUETOOTH</h2>
 
         {/* Connection Status */}
-        <div className="mb-4">
-          <span
-            className={`font-semibold ${
-              isConnected ? "text-green-600" : "text-red-600"
-            }`}
-          >
-            {isConnected
-              ? `Jetson is CONNECTED to ${connectedDevice}`
-              : "Jetson is NOT CONNECTED via Bluetooth"}
-          </span>
+        <div className="mb-4 p-4 rounded-lg border flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className={`w-3 h-3 rounded-full ${isConnected ? "bg-green-500" : "bg-red-500"}`}></div>
+            <div>
+              <div className={`font-semibold ${isConnected ? "text-green-600" : "text-red-600"}`}>
+                {isConnected ? "Connected" : "Not Connected"}
+              </div>
+              {isConnected && (
+                <div className="text-sm text-gray-600">
+                  {devices.find(d => d.address === connectedDevice)?.name || "Unknown Device"}
+                </div>
+              )}
+            </div>
+          </div>
+          {isConnected && (
+            <button
+              onClick={async () => {
+                try {
+                  const res = await fetch(`${API_BASE}/disconnect`, {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/json'
+                    }
+                  });
+                  
+                  if (!res.ok) {
+                    throw new Error(`HTTP error! status: ${res.status}`);
+                  }
+                  
+                  const data = await res.json();
+                  
+                  if (data.status === "disconnected") {
+                    setIsConnected(false);
+                    setConnectedDevice(null);
+                    // Refresh device list after disconnect
+                    const res = await fetch(`${API_BASE}/scan?force=true`);
+                    const scanData = await res.json();
+                    setDevices(scanData.devices || []);
+                  } else {
+                    throw new Error('Disconnect failed: ' + (data.error || 'Unknown error'));
+                  }
+                } catch (err) {
+                  console.error('Disconnect failed:', err);
+                  alert('Failed to disconnect. Please try again.');
+                }
+              }}
+              className="px-3 py-1 text-sm text-red-600 border border-red-200 rounded-md hover:bg-red-50 transition-colors"
+            >
+              Disconnect
+            </button>
+          )}
         </div>
 
         <div className="space-y-6">
@@ -263,29 +430,94 @@ const Bluetooth = () => {
                   </p>
                 </div>
               </div>
-              <Switch
-                checked={isEnabled}
-                onCheckedChange={handleToggle}
-                disabled={loadingToggle}
-              />
+              {loadingToggle ? (
+                <div className="w-9 h-5 rounded-full bg-gray-200 animate-pulse" />
+              ) : (
+                <Switch
+                  checked={isEnabled}
+                  onCheckedChange={handleToggle}
+                  disabled={loadingToggle}
+                />
+              )}
             </div>
           </div>
 
           {/* Devices Section */}
-          <h3 className="text-xl font-bold">DEVICES</h3>
+          <div className="flex justify-between items-center">
+            <h3 className="text-xl font-bold">DEVICES</h3>
+            {isEnabled && (
+              <button
+                onClick={async () => {
+                  if (!scanning) {
+                    setScanning(true);
+                    try {
+                      const res = await fetch(`${API_BASE}/scan?force=true`);
+                      const data = await res.json();
+                      setDevices(prevDevices => {
+                        // Keep connected device at top if exists
+                        const newDevices = data.devices || [];
+                        if (connectedDevice) {
+                          const connected = prevDevices.find(d => d.address === connectedDevice);
+                          if (connected && !newDevices.some(d => d.address === connectedDevice)) {
+                            newDevices.unshift(connected);
+                          }
+                        }
+                        return newDevices;
+                      });
+                    } catch (err) {
+                      console.error("Manual scan failed:", err);
+                      setError("Scan failed");
+                    } finally {
+                      setScanning(false);
+                    }
+                  }
+                }}
+                className={`px-4 py-2 rounded-md ${
+                  scanning 
+                    ? 'bg-gray-100 text-gray-500 cursor-not-allowed' 
+                    : 'bg-blue-50 text-blue-600 hover:bg-blue-100'
+                } flex items-center gap-2 transition-colors`}
+                disabled={scanning}
+              >
+                {scanning ? (
+                  <>
+                    <div className="w-4 h-4 border-2 border-gray-300 border-t-gray-600 rounded-full animate-spin" />
+                    Scanning...
+                  </>
+                ) : (
+                  <>
+                    🔍 Scan for Devices
+                  </>
+                )}
+              </button>
+            )}
+          </div>
           {!isEnabled && (
             <p className="text-muted-foreground">
               Turn on Bluetooth to see available devices
             </p>
           )}
-          {isEnabled && scanning && <p>🔍 Scanning for devices...</p>}
           {isEnabled && !scanning && devices.length === 0 && (
-            <p>No devices found.</p>
+            <p>No devices found. Click Scan to search for devices.</p>
           )}
           {isEnabled && devices.length > 0 && (
             <ul className="space-y-2">
-              {devices.map((device) => {
-                const isDeviceConnected = isConnected && connectedDevice === device.address;
+              {devices
+                .sort((a, b) => {
+                  // Always keep connected device first
+                  const aConnected = isConnected && connectedDevice === a.address;
+                  const bConnected = isConnected && connectedDevice === b.address;
+                  if (aConnected && !bConnected) return -1;
+                  if (!aConnected && bConnected) return 1;
+                  // Then recently seen devices
+                  const aRecent = a.last_seen || 0;
+                  const bRecent = b.last_seen || 0;
+                  if (aRecent !== bRecent) return bRecent - aRecent;
+                  // Finally sort by name
+                  return (a.name || "").localeCompare(b.name || "");
+                })
+                .map((device) => {
+                  const isDeviceConnected = isConnected && connectedDevice === device.address;
                 return (
                   <li
                     key={device.address}
