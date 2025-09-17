@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import subprocess
 import asyncio
+import time
 from bleak import BleakScanner, BleakClient
 import screen_brightness_control as sbc
 import alsaaudio
@@ -120,25 +121,162 @@ def bluetooth_status():
     except:
         return "unknown"
 
-async def scan_devices(timeout: int = 5):
+# Store discovered devices
+discovered_devices = {}
+last_scan_time = 0
+SCAN_INTERVAL = 30  # Minimum seconds between full scans
+
+async def scan_devices(timeout: int = 5, force_scan: bool = False):
+    global discovered_devices, last_scan_time
+    current_time = time.time()
+    
     try:
+        # Return cached devices if scan interval hasn't elapsed
+        if not force_scan and (current_time - last_scan_time) < SCAN_INTERVAL:
+            return list(discovered_devices.values())
+
+        # Stop any ongoing scan
+        subprocess.run(["bluetoothctl", "scan", "off"], capture_output=True)
+        
+        # First attempt to get detailed device info using bluetoothctl
+        try:
+            subprocess.run(["bluetoothctl", "scan", "on"], timeout=2)  # Start brief scan
+            result = subprocess.run(["bluetoothctl", "devices"], capture_output=True, text=True)
+            bt_devices = {}
+            
+            for line in result.stdout.splitlines():
+                if line.startswith("Device"):
+                    parts = line.split(" ", 2)  # Split into 3 parts: "Device", MAC, and Name
+                    if len(parts) >= 2:
+                        addr = parts[1]
+                        name = parts[2] if len(parts) > 2 else None
+                        bt_devices[addr] = {"name": name, "address": addr}
+                        addr = parts[1]
+                        name = parts[2] if len(parts) > 2 else None
+                        bt_devices[addr] = {"name": name, "address": addr}
+        except Exception as e:
+            print(f"Bluetoothctl scan failed: {e}")
+            bt_devices = {}
+
+        # Then use BleakScanner for additional devices and details
         devices = await BleakScanner.discover(timeout=timeout)
-        return [{"name": d.name, "address": d.address} for d in devices]
+        
+        # Update discovered devices with new information
+        for d in devices:
+            device_info = discovered_devices.get(d.address, {
+                "name": None,
+                "address": d.address,
+                "type": "Unknown",
+                "last_seen": 0
+            })
+            
+            # Update device info with new data
+            if d.name:
+                device_info["name"] = d.name
+            elif bt_devices.get(d.address, {}).get("name"):
+                device_info["name"] = bt_devices[d.address]["name"]
+            
+            # Try to determine device type from name if not already set
+            if device_info["type"] == "Unknown" and device_info["name"]:
+                name_lower = device_info["name"].lower()
+                if any(keyword in name_lower for keyword in ["headphone", "speaker", "audio"]):
+                    device_info["type"] = "Audio Device"
+                elif "mouse" in name_lower:
+                    device_info["type"] = "Mouse"
+                elif "keyboard" in name_lower:
+                    device_info["type"] = "Keyboard"
+                elif "phone" in name_lower:
+                    device_info["type"] = "Phone"
+                elif any(keyword in name_lower for keyword in ["watch", "band", "fit"]):
+                    device_info["type"] = "Wearable"
+            
+            device_info["last_seen"] = current_time
+            discovered_devices[d.address] = device_info
+        
+        # Add any devices from bluetoothctl that weren't found by BleakScanner
+        for addr, device in bt_devices.items():
+            if addr not in discovered_devices:
+                device["type"] = "Unknown"
+                device["last_seen"] = current_time
+                discovered_devices[addr] = device
+        
+        # Remove devices not seen in the last 5 minutes
+        stale_time = current_time - 300  # 5 minutes
+        discovered_devices = {
+            addr: dev for addr, dev in discovered_devices.items()
+            if dev["last_seen"] > stale_time
+        }
+        
+        last_scan_time = current_time
+        return list(discovered_devices.values())
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 async def connect_device(address: str):
     try:
+        # Stop scanning before attempting connection
+        subprocess.run(["bluetoothctl", "scan", "off"], capture_output=True)
+        await asyncio.sleep(1)  # Give time for scan to stop
+        
+        # Attempt connection with bluetoothctl first
+        try:
+            subprocess.run(["bluetoothctl", "connect", address], check=True, timeout=10)
+            # Check if connection was successful
+            result = subprocess.run(["bluetoothctl", "info", address], capture_output=True, text=True)
+            if "Connected: yes" in result.stdout:
+                return {"status": "connected", "address": address}
+        except subprocess.CalledProcessError as e:
+            print(f"Bluetoothctl connection failed: {e}")
+            # Fall through to try BleakClient
+            
+        # Try BleakClient as backup
         async with BleakClient(address, timeout=10.0) as client:
             if client.is_connected:
                 return {"status": "connected", "address": address}
-            return {"status": "failed", "error": "Connection failed"}
+            return {"status": "failed", "error": "Connection failed with both methods"}
     except Exception as e:
         return {"status": "failed", "error": str(e)}
+    finally:
+        # Resume scanning after connection attempt
+        subprocess.run(["bluetoothctl", "scan", "on"], capture_output=True)
 
 @fastapi_app.get("/bluetooth/status")
 def get_status():
-    return {"status": bluetooth_status()}
+    try:
+        # Get the Bluetooth power status first
+        status = bluetooth_status()
+        
+        # If Bluetooth is off, return early
+        if status == "off":
+            return {"status": "off", "connected": False}
+            
+        # Check for connected devices using bluetoothctl
+        result = subprocess.run(
+            ["bluetoothctl", "info"],
+            capture_output=True,
+            text=True
+        )
+        
+        connected_device = None
+        device_name = None
+        
+        # Parse the bluetoothctl info output
+        if "Connected: yes" in result.stdout:
+            for line in result.stdout.splitlines():
+                if line.strip().startswith("Device "):
+                    connected_device = line.split()[1]
+                elif line.strip().startswith("Name: "):
+                    device_name = line.split(": ", 1)[1]
+                    
+        return {
+            "status": status,
+            "connected": connected_device is not None,
+            "device": connected_device,
+            "device_name": device_name
+        }
+    except Exception as e:
+        print(f"Error getting Bluetooth status: {e}")
+        return {"status": bluetooth_status(), "connected": False}
 
 @fastapi_app.post("/bluetooth/toggle")
 def toggle_bluetooth(req: ToggleRequest):
@@ -154,7 +292,10 @@ def toggle_bluetooth(req: ToggleRequest):
 
 @fastapi_app.get("/bluetooth/scan")
 async def scan():
-    devices = await scan_devices(timeout=5)
+    # Check if we need to force a scan
+    current_time = time.time()
+    force_scan = (current_time - last_scan_time) >= SCAN_INTERVAL
+    devices = await scan_devices(timeout=5, force_scan=force_scan)
     return {"devices": devices}
 
 @fastapi_app.post("/bluetooth/connect")
@@ -403,6 +544,33 @@ async def toggle_wifi(req: ToggleRequest):
 @fastapi_app.post("/wifi/connect")
 async def connect_wifi(req: WifiConnectRequest):
     try:
+        # Check if we're currently connected to a network
+        current = current_wifi()
+        if current["connected"]:
+            # If we're already connected to the requested network, return early
+            if current["ssid"] == req.ssid:
+                return {"status": "connected", "connection": current}
+            
+            # Disconnect from current network first
+            try:
+                disconnect_result = subprocess.run(
+                    ["nmcli", "device", "disconnect", current["device"]],
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                # Wait for disconnection
+                await asyncio.sleep(2)
+            except subprocess.CalledProcessError as e:
+                print(f"Warning: Failed to disconnect from current network: {str(e)}")
+
+        # Force a rescan of available networks
+        try:
+            subprocess.run(["nmcli", "device", "wifi", "rescan"], check=True)
+            await asyncio.sleep(1)  # Give time for the scan to complete
+        except subprocess.CalledProcessError as e:
+            print(f"Warning: Failed to rescan networks: {str(e)}")
+
         # Build the nmcli command based on whether a password is provided
         if req.password:
             cmd = ["nmcli", "device", "wifi", "connect", req.ssid, "password", req.password]
@@ -414,8 +582,8 @@ async def connect_wifi(req: WifiConnectRequest):
         if result.returncode != 0:
             raise HTTPException(status_code=400, detail=f"Failed to connect: {result.stderr}")
             
-        # Wait briefly for connection to establish
-        await asyncio.sleep(2)
+        # Wait for connection to establish
+        await asyncio.sleep(3)
         
         # Get current connection status
         current = current_wifi()

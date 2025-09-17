@@ -43,7 +43,26 @@ const Bluetooth = () => {
         if (isSubscribed) {
           setIsEnabled(data.status === "on");
           setIsConnected(data.connected);
-          setConnectedDevice(data.device || null);
+          if (data.connected) {
+            // Find the connected device in the current devices list or create a new entry
+            const connectedDeviceInfo = {
+              name: data.device_name || "Connected Device",
+              address: data.device,
+              type: "Connected Device"
+            };
+            setConnectedDevice(data.device);
+            
+            // Update devices list to include connected device if not present
+            setDevices(prevDevices => {
+              const deviceExists = prevDevices.some(d => d.address === data.device);
+              if (!deviceExists && data.device) {
+                return [...prevDevices, connectedDeviceInfo];
+              }
+              return prevDevices;
+            });
+          } else {
+            setConnectedDevice(null);
+          }
         }
       } catch (err) {
         console.error("Failed to fetch Bluetooth status:", err);
@@ -135,8 +154,8 @@ const Bluetooth = () => {
 
   // 3️⃣ Scan devices when Bluetooth is ON
   useEffect(() => {
-    if (!isEnabled) {
-      setDevices([]);
+    if (!isEnabled || connectingDevice) {
+      if (!isEnabled) setDevices([]);
       return;
     }
 
@@ -145,7 +164,17 @@ const Bluetooth = () => {
       try {
         const res = await fetch(`${API_BASE}/scan`);
         const data = await res.json();
-        setDevices(data.devices || []);
+        setDevices(prevDevices => {
+          // Keep connected device in the list
+          const newDevices = data.devices || [];
+          if (connectedDevice) {
+            const connected = prevDevices.find(d => d.address === connectedDevice);
+            if (connected && !newDevices.some(d => d.address === connectedDevice)) {
+              newDevices.push(connected);
+            }
+          }
+          return newDevices;
+        });
       } catch (err) {
         console.error("Failed to scan devices:", err);
       } finally {
@@ -153,18 +182,14 @@ const Bluetooth = () => {
       }
     };
 
+    // Initial scan
     scanDevices();
     
-    // Scan every 3 seconds for the first 30 seconds
-    let fastInterval = setInterval(scanDevices, 3000);
-    setTimeout(() => {
-      clearInterval(fastInterval);
-      // Then switch to scanning every 10 seconds
-      fastInterval = setInterval(scanDevices, 10000);
-    }, 30000);
+    // Scan every 15 seconds
+    const interval = setInterval(scanDevices, 15000);
     
-    return () => clearInterval(fastInterval);
-  }, [isEnabled]);
+    return () => clearInterval(interval);
+  }, [isEnabled, connectingDevice, connectedDevice]);
 
   // 4️⃣ Connect to a device
   const handleConnect = async (address: string) => {

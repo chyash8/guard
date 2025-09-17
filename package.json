@@ -4,7 +4,8 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "bash -c 'if ! ps aux | grep \"node index.js --listen 3333\" | grep -v grep > /dev/null; then cd ~/tvoip && nohup node index.js --listen 3333 --input hw:2,0 --output hw:2,0 > voip.log 2>&1 & echo \"VoIP listener started\" && sleep 2; else echo \"VoIP listener already running\"; fi && vite'",
+    "dev:vite-only": "vite",
     "backend": "cd src/backend && python app.py",
     "build": "vite build",
     "build:dev": "vite build --mode development",
@@ -76,3 +77,5 @@
     "vite": "^5.4.20"
   }
 }
+ 
+ 
