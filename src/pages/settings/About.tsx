@@ -28,7 +28,12 @@ const About = () => {
           
           <div>
             <h3 className="text-xl font-bold mb-2">SIM CARD NUMBER</h3>
-            <p className="text-foreground font-mono">+91 00000 00000</p>
+            <p className="text-foreground font-mono">+91 96659 99862</p>
+          </div>
+
+          <div>
+            <h3 className="text-xl font-bold mb-2">EMAIL</h3>
+            <p className="text-foreground font-mono">info@sakarrobotics.com</p>
           </div>
         </div>
       </div>

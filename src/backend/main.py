@@ -93,6 +93,46 @@ async def set_volume(request: VolumeRequest):
 # Bluetooth
 # --------------------------
 
+def safe_bt_command(cmd, timeout=5):
+    """Safely run a bluetooth command with proper error handling"""
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if result.returncode == 0:
+            return result
+    except subprocess.TimeoutExpired:
+        print(f"Command timed out: {cmd}")
+    except subprocess.CalledProcessError as e:
+        print(f"Command failed: {cmd}, error: {e}")
+    except Exception as e:
+        print(f"Unexpected error running command: {cmd}, error: {e}")
+    return None
+
+def safe_disconnect_device(address):
+    """Safely disconnect a bluetooth device with proper error handling"""
+    try:
+        # Try normal disconnect first
+        result = safe_bt_command(["bluetoothctl", "disconnect", address], timeout=5)
+        if result and "successful" in result.stdout.lower():
+            return True
+            
+        # If that fails, try power cycling
+        safe_bt_command(["bluetoothctl", "power", "off"], timeout=3)
+        time.sleep(1)
+        safe_bt_command(["bluetoothctl", "power", "on"], timeout=3)
+        time.sleep(1)
+        
+        # Try disconnect again
+        result = safe_bt_command(["bluetoothctl", "disconnect", address], timeout=5)
+        if result and "successful" in result.stdout.lower():
+            return True
+            
+        # If still not disconnected, try removing the device
+        safe_bt_command(["bluetoothctl", "remove", address], timeout=5)
+        return True
+    except Exception as e:
+        print(f"Error in safe_disconnect_device: {e}")
+        return False
+
 def bluetooth_on():
     try:
         # First unblock using rfkill
@@ -203,124 +243,218 @@ def bluetooth_status():
         print(f"Error checking bluetooth status: {e}")
         return "unknown"
 
-# Store discovered devices
+# Global state management
 discovered_devices = {}
 last_scan_time = 0
 SCAN_INTERVAL = 30  # Minimum seconds between full scans
+active_scan_process = None
+scanning_lock = asyncio.Lock()  # To prevent concurrent scan operations
+
+def safe_run_sync(cmd, timeout=5, check=False):
+    """Safely run a command synchronously with timeout"""
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=check)
+        return result
+    except subprocess.TimeoutExpired:
+        print(f"Command timed out: {cmd}")
+        return None
+    except subprocess.CalledProcessError as e:
+        print(f"Command failed: {cmd}, error: {e}")
+        return None
+    except Exception as e:
+        print(f"Unexpected error running command: {cmd}, error: {e}")
+        return None
+
+async def stop_active_scan():
+    global active_scan_process
+    if active_scan_process:
+        try:
+            # First try to stop scan via bluetoothctl
+            subprocess.run(["bluetoothctl", "scan", "off"], check=True, timeout=5)
+            # Then terminate the process if it's still running
+            if active_scan_process.poll() is None:
+                active_scan_process.terminate()
+                await asyncio.sleep(0.5)
+                if active_scan_process.poll() is None:
+                    active_scan_process.kill()
+            active_scan_process = None
+        except Exception as e:
+            print(f"Error stopping scan: {e}")
 
 async def scan_devices(timeout: int = 5, force_scan: bool = False):
-    global discovered_devices, last_scan_time
+    global discovered_devices, last_scan_time, active_scan_process
     current_time = time.time()
     
     try:
-        # Return cached devices if scan interval hasn't elapsed
-        if not force_scan and (current_time - last_scan_time) < SCAN_INTERVAL:
-            return list(discovered_devices.values())
+        # Use the lock to prevent concurrent scans
+        async with scanning_lock:
+            # Return cached devices if scan interval hasn't elapsed
+            if not force_scan and (current_time - last_scan_time) < SCAN_INTERVAL:
+                return list(discovered_devices.values())
+                
+            # Stop any existing scan first
+            await stop_active_scan()
 
-        # Stop any ongoing scan
-        subprocess.run(["bluetoothctl", "scan", "off"], capture_output=True)
-        
-        # First attempt to get detailed device info using bluetoothctl
-        try:
-            subprocess.run(["bluetoothctl", "scan", "on"], timeout=2)  # Start brief scan
-            result = subprocess.run(["bluetoothctl", "devices"], capture_output=True, text=True)
+            # Stop any ongoing scan
+            subprocess.run(["bluetoothctl", "scan", "off"], capture_output=True)
+            
+            # Initialize devices dict
             bt_devices = {}
             
-            for line in result.stdout.splitlines():
-                if line.startswith("Device"):
-                    parts = line.split(" ", 2)  # Split into 3 parts: "Device", MAC, and Name
-                    if len(parts) >= 2:
-                        addr = parts[1]
-                        name = parts[2] if len(parts) > 2 else None
-                        bt_devices[addr] = {"name": name, "address": addr}
-                        addr = parts[1]
-                        name = parts[2] if len(parts) > 2 else None
-                        bt_devices[addr] = {"name": name, "address": addr}
-        except Exception as e:
-            print(f"Bluetoothctl scan failed: {e}")
-            bt_devices = {}
+            # First attempt to get detailed device info using bluetoothctl
+            try:
+                subprocess.run(["bluetoothctl", "scan", "on"], timeout=2)  # Start brief scan
+                result = subprocess.run(["bluetoothctl", "devices"], capture_output=True, text=True)
+                
+                for line in result.stdout.splitlines():
+                    if line.startswith("Device"):
+                        parts = line.split(" ", 2)  # Split into 3 parts: "Device", MAC, and Name
+                        if len(parts) >= 2:
+                            addr = parts[1]
+                            name = parts[2] if len(parts) > 2 else None
+                            bt_devices[addr] = {"name": name, "address": addr}
+            except Exception as e:
+                print(f"Bluetoothctl scan failed: {e}")
 
-        # Then use BleakScanner for additional devices and details
-        devices = await BleakScanner.discover(timeout=timeout)
-        
-        # Update discovered devices with new information
-        for d in devices:
-            device_info = discovered_devices.get(d.address, {
-                "name": None,
-                "address": d.address,
-                "type": "Unknown",
-                "last_seen": 0
-            })
-            
-            # Update device info with new data
-            if d.name:
-                device_info["name"] = d.name
-            elif bt_devices.get(d.address, {}).get("name"):
-                device_info["name"] = bt_devices[d.address]["name"]
-            
-            # Try to determine device type from name if not already set
-            if device_info["type"] == "Unknown" and device_info["name"]:
-                name_lower = device_info["name"].lower()
-                if any(keyword in name_lower for keyword in ["headphone", "speaker", "audio"]):
-                    device_info["type"] = "Audio Device"
-                elif "mouse" in name_lower:
-                    device_info["type"] = "Mouse"
-                elif "keyboard" in name_lower:
-                    device_info["type"] = "Keyboard"
-                elif "phone" in name_lower:
-                    device_info["type"] = "Phone"
-                elif any(keyword in name_lower for keyword in ["watch", "band", "fit"]):
-                    device_info["type"] = "Wearable"
-            
-            device_info["last_seen"] = current_time
-            discovered_devices[d.address] = device_info
-        
-        # Add any devices from bluetoothctl that weren't found by BleakScanner
-        for addr, device in bt_devices.items():
-            if addr not in discovered_devices:
-                device["type"] = "Unknown"
-                device["last_seen"] = current_time
-                discovered_devices[addr] = device
-        
-        # Remove devices not seen in the last 5 minutes
-        stale_time = current_time - 300  # 5 minutes
-        discovered_devices = {
-            addr: dev for addr, dev in discovered_devices.items()
-            if dev["last_seen"] > stale_time
-        }
-        
-        last_scan_time = current_time
-        return list(discovered_devices.values())
+            try:
+                # Then use BleakScanner for additional devices and details
+                devices = await BleakScanner.discover(timeout=timeout)
+                
+                # Update discovered devices with new information
+                for d in devices:
+                    device_info = discovered_devices.get(d.address, {
+                        "name": None,
+                        "address": d.address,
+                        "type": "Unknown",
+                        "last_seen": 0
+                    })
+                    
+                    # Update device info with new data
+                    if d.name:
+                        device_info["name"] = d.name
+                    elif bt_devices.get(d.address, {}).get("name"):
+                        device_info["name"] = bt_devices[d.address]["name"]
+                    
+                    # Try to determine device type from name if not already set
+                    if device_info["type"] == "Unknown" and device_info["name"]:
+                        name_lower = device_info["name"].lower()
+                        if any(keyword in name_lower for keyword in ["headphone", "speaker", "audio"]):
+                            device_info["type"] = "Audio Device"
+                        elif "mouse" in name_lower:
+                            device_info["type"] = "Mouse"
+                        elif "keyboard" in name_lower:
+                            device_info["type"] = "Keyboard"
+                        elif "phone" in name_lower:
+                            device_info["type"] = "Phone"
+                        elif any(keyword in name_lower for keyword in ["watch", "band", "fit"]):
+                            device_info["type"] = "Wearable"
+                    
+                    device_info["last_seen"] = current_time
+                    discovered_devices[d.address] = device_info
+                
+                # Add any devices from bluetoothctl that weren't found by BleakScanner
+                for addr, device in bt_devices.items():
+                    if addr not in discovered_devices:
+                        device["type"] = "Unknown"
+                        device["last_seen"] = current_time
+                        discovered_devices[addr] = device
+                
+                # Remove devices not seen in the last 5 minutes
+                stale_time = current_time - 300  # 5 minutes
+                discovered_devices = {
+                    addr: dev for addr, dev in discovered_devices.items()
+                    if dev["last_seen"] > stale_time
+                }
+                
+                last_scan_time = current_time
+                return list(discovered_devices.values())
+                
+            except Exception as e:
+                print(f"Error during BleakScanner discovery: {e}")
+                # If BleakScanner fails, return whatever devices we found from bluetoothctl
+                return [device for device in bt_devices.values()]
+                
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Scan failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Scan failed: {str(e)}")
 
 async def connect_device(address: str):
+    print(f"\n=== Starting connection process for {address} ===")
     try:
-        # Stop scanning before attempting connection
-        subprocess.run(["bluetoothctl", "scan", "off"], capture_output=True)
-        await asyncio.sleep(1)  # Give time for scan to stop
+        # Properly stop any active scanning
+        print("Stopping active scans...")
+        await stop_active_scan()
+        await asyncio.sleep(1)  # Give time for scan cleanup
         
-        # Attempt connection with bluetoothctl first
+        # Prepare adapter for connection
+        print("Preparing adapter...")
         try:
-            subprocess.run(["bluetoothctl", "connect", address], check=True, timeout=10)
-            # Check if connection was successful
-            result = subprocess.run(["bluetoothctl", "info", address], capture_output=True, text=True)
+            # Ensure adapter is powered and ready
+            subprocess.run(["bluetoothctl", "power", "off"], check=True, timeout=5)
+            await asyncio.sleep(1)
+            subprocess.run(["bluetoothctl", "power", "on"], check=True, timeout=5)
+            await asyncio.sleep(1)
+            
+            # Set necessary modes for connection
+            subprocess.run(["bluetoothctl", "pairable", "on"], check=True, timeout=5)
+            subprocess.run(["bluetoothctl", "discoverable", "on"], check=True, timeout=5)
+            
+            print("Attempting connection with bluetoothctl...")
+            # First try bluetoothctl connection
+            subprocess.run(["bluetoothctl", "connect", address], check=True, timeout=15)
+            await asyncio.sleep(2)  # Give connection time to stabilize
+            
+            # Verify connection
+            result = subprocess.run(["bluetoothctl", "info", address], 
+                                  capture_output=True, text=True, timeout=5)
+            
             if "Connected: yes" in result.stdout:
-                return {"status": "connected", "address": address}
+                print("Bluetoothctl connection successful")
+                # Get device name if available
+                device_name = None
+                for line in result.stdout.splitlines():
+                    if line.strip().startswith("Name: "):
+                        device_name = line.split(": ", 1)[1]
+                        break
+                
+                return {
+                    "status": "connected",
+                    "address": address,
+                    "name": device_name
+                }
+                
         except subprocess.CalledProcessError as e:
             print(f"Bluetoothctl connection failed: {e}")
-            # Fall through to try BleakClient
+        except subprocess.TimeoutExpired as e:
+            print(f"Bluetoothctl connection timed out: {e}")
             
-        # Try BleakClient as backup
-        async with BleakClient(address, timeout=10.0) as client:
-            if client.is_connected:
-                return {"status": "connected", "address": address}
-            return {"status": "failed", "error": "Connection failed with both methods"}
+        # If bluetoothctl failed, try BleakClient as backup
+        print("Attempting connection with BleakClient...")
+        try:
+            async with BleakClient(address, timeout=10.0) as client:
+                if client.is_connected:
+                    print("BleakClient connection successful")
+                    return {"status": "connected", "address": address}
+                print("BleakClient connection failed")
+                return {"status": "failed", "error": "Connection failed with both methods"}
+        except Exception as bleak_error:
+            print(f"BleakClient connection error: {bleak_error}")
+            return {"status": "failed", "error": str(bleak_error)}
+            
     except Exception as e:
+        print(f"Connection process error: {e}")
         return {"status": "failed", "error": str(e)}
     finally:
-        # Resume scanning after connection attempt
-        subprocess.run(["bluetoothctl", "scan", "on"], capture_output=True)
+        try:
+            # Ensure scan is properly restarted
+            print("Restarting scan process...")
+            subprocess.run(["bluetoothctl", "scan", "off"], check=True, timeout=5)
+            await asyncio.sleep(1)
+            subprocess.run(["bluetoothctl", "scan", "on"], check=True, timeout=5)
+            print("Connection process complete")
+        except Exception as cleanup_error:
+            print(f"Error during connection cleanup: {cleanup_error}")
+            # Don't raise the error as it's cleanup code
 
 @fastapi_app.get("/bluetooth/status")
 def get_status():
@@ -421,56 +555,177 @@ async def scan(force: bool = False):
 
 @fastapi_app.post("/bluetooth/connect")
 async def connect(req: ConnectRequest):
-    result = await connect_device(req.address)
-    if result["status"] != "connected":
-        raise HTTPException(status_code=500, detail=result.get("error"))
-    return result
+    print(f"Starting connection to device: {req.address}")
+    try:
+        result = await connect_device(req.address)
+        if result["status"] != "connected":
+            raise HTTPException(status_code=500, detail=result.get("error"))
+        
+        # After successful connection, ensure the adapter state is properly maintained
+        try:
+            print("Setting up post-connection state...")
+            # Keep discovery on but reduce its aggressiveness
+            subprocess.run(["bluetoothctl", "discoverable", "on"], check=True, timeout=5)
+            subprocess.run(["bluetoothctl", "pairable", "on"], check=True, timeout=5)
+            
+            # Trust the device to maintain connection
+            subprocess.run(["bluetoothctl", "trust", req.address], check=True, timeout=5)
+            
+            # Restart scanning in a controlled way
+            subprocess.run(["bluetoothctl", "scan", "off"], check=True, timeout=5)
+            await asyncio.sleep(1)
+            subprocess.run(["bluetoothctl", "scan", "on"], check=True, timeout=5)
+            print("Post-connection setup complete")
+        except Exception as setup_error:
+            print(f"Warning: Post-connection setup had issues: {setup_error}")
+            # Don't fail the connection if post-setup has issues
+        
+        return result
+    except Exception as e:
+        print(f"Connection error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+async def run_bt_command(cmd, timeout=5, check=True, retry_count=3):
+    """Helper function to run bluetooth commands safely"""
+    for attempt in range(retry_count):
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=check
+            )
+            return result
+        except subprocess.TimeoutExpired as e:
+            print(f"Command {cmd} timed out (attempt {attempt + 1}): {e}")
+            if attempt == retry_count - 1:
+                raise
+        except subprocess.CalledProcessError as e:
+            print(f"Command {cmd} failed (attempt {attempt + 1}): {e}")
+            if attempt == retry_count - 1:
+                raise
+        except Exception as e:
+            print(f"Unexpected error running {cmd} (attempt {attempt + 1}): {e}")
+            if attempt == retry_count - 1:
+                raise
+        await asyncio.sleep(1)
+    return None
+
+def safe_run_sync(cmd, timeout=5, check=False):
+    """Safely run a command synchronously with timeout"""
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=check)
+        return result
+    except subprocess.TimeoutExpired:
+        print(f"Command timed out: {cmd}")
+        return None
+    except subprocess.CalledProcessError as e:
+        print(f"Command failed: {cmd}, error: {e}")
+        return None
+    except Exception as e:
+        print(f"Unexpected error running command: {cmd}, error: {e}")
+        return None
 
 @fastapi_app.post("/bluetooth/disconnect")
 async def disconnect_bluetooth():
+    """Handle Bluetooth device disconnection with robust error handling"""
+    print("\n=== Starting disconnect process ===")
     try:
-        # Stop scanning before disconnect
-        subprocess.run(["bluetoothctl", "scan", "off"], capture_output=True)
-        await asyncio.sleep(1)
+        async with scanning_lock:  # Use lock for the main disconnect process
+            # Initial scan cleanup
+            print("Initial cleanup...")
+            safe_bt_command(["bluetoothctl", "scan", "off"], timeout=3)
+            await asyncio.sleep(0.5)
 
-        # Get the currently connected device info
-        result = subprocess.run(["bluetoothctl", "info"], capture_output=True, text=True)
-        
-        device_address = None
-        device_name = None
-        if "Connected: yes" in result.stdout:
-            # Extract device information from the info output
-            for line in result.stdout.splitlines():
-                if line.strip().startswith("Device "):
-                    device_address = line.strip().split()[1]
-                elif line.strip().startswith("Name: "):
-                    device_name = line.split(": ", 1)[1]
+            # Get currently connected device info with error handling
+            print("Getting connected device info...")
+            device_info = {
+                'address': None,
+                'name': None,
+                'connected': False
+            }
             
-            if device_address:
-                # Disconnect the device
-                subprocess.run(["bluetoothctl", "disconnect", device_address], check=True)
-                await asyncio.sleep(1)  # Give time for disconnect to complete
+            result = safe_bt_command(["bluetoothctl", "info"], timeout=5)
+            if result and result.stdout:
+                for line in result.stdout.splitlines():
+                    line = line.strip()
+                    if line.startswith("Device "):
+                        device_info['address'] = line.split()[1]
+                    elif line.startswith("Name: "):
+                        device_info['name'] = line.split(": ", 1)[1]
+                    elif line == "Connected: yes":
+                        device_info['connected'] = True
+            
+            if not (device_info['connected'] and device_info['address']):
+                print("No connected device found")
+                return {"status": "not_connected"}
                 
-                # Notify all connected clients about the Bluetooth state change
-                status_data = {
-                    "status": "on",  # Bluetooth is still on, just disconnected
-                    "connected": False,
-                    "device": None,
-                    "device_name": None,
-                    "last_device": {  # Include info about the device that was disconnected
-                        "address": device_address,
-                        "name": device_name
+            print(f"Found connected device: {device_info['name']} ({device_info['address']})")
+            
+            # Try to disconnect using our safe_disconnect_device helper
+            disconnect_success = safe_disconnect_device(device_info['address'])
+            
+            if disconnect_success:
+                print("\nDevice successfully disconnected, cleaning up...")
+                # Final cleanup steps
+                try:
+                    # Reset adapter state
+                    safe_bt_command(["bluetoothctl", "scan", "off"], timeout=3)
+                    safe_bt_command(["bluetoothctl", "power", "off"], timeout=3)
+                    await asyncio.sleep(1)
+                    safe_bt_command(["bluetoothctl", "power", "on"], timeout=3)
+                    await asyncio.sleep(1)
+                    safe_bt_command(["bluetoothctl", "pairable", "on"], timeout=3)
+                    safe_bt_command(["bluetoothctl", "discoverable", "on"], timeout=3)
+                    safe_bt_command(["bluetoothctl", "scan", "on"], timeout=3)
+                    
+                    # Notify all connected clients about the Bluetooth state change
+                    status_data = {
+                        "status": "on",  # Bluetooth is still on, just disconnected
+                        "connected": False,
+                        "device": None,
+                        "device_name": None,
+                        "last_device": {
+                            "address": device_info['address'],
+                            "name": device_info['name']
+                        }
                     }
+                    await sio.emit('bluetooth_state_change', status_data)
+                    
+                except Exception as cleanup_error:
+                    print(f"Warning: Cleanup had issues: {cleanup_error}")
+                    return {
+                        "status": "disconnected",
+                        "success": True,
+                        "warning": "Some cleanup steps failed"
+                    }
+                    
+                return {
+                    "status": "disconnected",
+                    "success": True
                 }
-                await sio.emit('bluetooth_state_change', status_data)
-                return {"status": "disconnected"}
-        
-        return {"status": "not_connected"}
+            else:
+                raise HTTPException(
+                    status_code=500, 
+                    detail="Failed to disconnect device after multiple attempts"
+                )
+                
+    except HTTPException as he:
+        raise he
     except Exception as e:
+        print(f"Error during disconnect: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        # Resume scanning after disconnect
-        subprocess.run(["bluetoothctl", "scan", "on"], capture_output=True)
+        try:
+            print("\nEnsuring adapter is in clean state...")
+            # Basic adapter reset - these must succeed
+            safe_bt_command(["rfkill", "unblock", "bluetooth"], timeout=3)
+            safe_bt_command(["bluetoothctl", "power", "on"], timeout=3)
+            safe_bt_command(["bluetoothctl", "scan", "on"], timeout=3)
+        except Exception as final_error:
+            print(f"Warning: Final cleanup had issues: {final_error}")
+        print("=== Disconnect process complete ===\n")
 
 # --------------------------
 # Brightness
