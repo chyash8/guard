@@ -631,13 +631,19 @@ def safe_run_sync(cmd, timeout=5, check=False):
 async def disconnect_bluetooth():
     """Handle Bluetooth device disconnection with robust error handling"""
     print("\n=== Starting disconnect process ===")
+    # Initialize response at the top level
+    response = {"status": "unknown", "success": False}
+    
     try:
         async with scanning_lock:  # Use lock for the main disconnect process
-            # Initial scan cleanup
+            # Initial scan cleanup - don't throw on failure
             print("Initial cleanup...")
-            safe_bt_command(["bluetoothctl", "scan", "off"], timeout=3)
-            await asyncio.sleep(0.5)
-
+            try:
+                safe_bt_command(["bluetoothctl", "scan", "off"], timeout=3)
+                await asyncio.sleep(0.5)
+            except Exception as cleanup_error:
+                print(f"Initial cleanup warning (non-fatal): {cleanup_error}")
+            
             # Get currently connected device info with error handling
             print("Getting connected device info...")
             device_info = {
@@ -668,19 +674,32 @@ async def disconnect_bluetooth():
             
             if disconnect_success:
                 print("\nDevice successfully disconnected, cleaning up...")
-                # Final cleanup steps
+                # Final cleanup steps - each step handled separately
+                cleanup_errors = []
+                
                 try:
-                    # Reset adapter state
-                    safe_bt_command(["bluetoothctl", "scan", "off"], timeout=3)
-                    safe_bt_command(["bluetoothctl", "power", "off"], timeout=3)
-                    await asyncio.sleep(1)
-                    safe_bt_command(["bluetoothctl", "power", "on"], timeout=3)
-                    await asyncio.sleep(1)
-                    safe_bt_command(["bluetoothctl", "pairable", "on"], timeout=3)
-                    safe_bt_command(["bluetoothctl", "discoverable", "on"], timeout=3)
-                    safe_bt_command(["bluetoothctl", "scan", "on"], timeout=3)
+                    # Reset adapter state - each command separate with error handling
+                    cleanup_steps = [
+                        ("scan off", ["bluetoothctl", "scan", "off"]),
+                        ("power off", ["bluetoothctl", "power", "off"]),
+                        ("power on", ["bluetoothctl", "power", "on"]),
+                        ("pairable on", ["bluetoothctl", "pairable", "on"]),
+                        ("discoverable on", ["bluetoothctl", "discoverable", "on"]),
+                        ("scan on", ["bluetoothctl", "scan", "on"])
+                    ]
                     
-                    # Notify all connected clients about the Bluetooth state change
+                    for step_name, cmd in cleanup_steps:
+                        try:
+                            result = safe_bt_command(cmd, timeout=3)
+                            if not result:
+                                cleanup_errors.append(f"{step_name} failed")
+                            await asyncio.sleep(0.5)
+                        except Exception as step_error:
+                            print(f"Cleanup step '{step_name}' error (non-fatal): {step_error}")
+                            cleanup_errors.append(f"{step_name} error: {str(step_error)}")
+                            continue  # Continue with next step regardless of errors
+                    
+                    # Prepare status update for clients - will be sent even if some cleanup failed
                     status_data = {
                         "status": "on",  # Bluetooth is still on, just disconnected
                         "connected": False,
@@ -691,41 +710,64 @@ async def disconnect_bluetooth():
                             "name": device_info['name']
                         }
                     }
-                    await sio.emit('bluetooth_state_change', status_data)
+                    
+                    # Try to notify clients - don't throw if it fails
+                    try:
+                        await sio.emit('bluetooth_state_change', status_data)
+                    except Exception as emit_error:
+                        print(f"Warning: Failed to notify clients (non-fatal): {emit_error}")
+                        cleanup_errors.append(f"Client notification failed: {str(emit_error)}")
                     
                 except Exception as cleanup_error:
-                    print(f"Warning: Cleanup had issues: {cleanup_error}")
-                    return {
-                        "status": "disconnected",
-                        "success": True,
-                        "warning": "Some cleanup steps failed"
-                    }
-                    
-                return {
+                    print(f"Warning: Main cleanup block error (non-fatal): {cleanup_error}")
+                    cleanup_errors.append(f"General cleanup error: {str(cleanup_error)}")
+                
+                # Always return success if we got this far, but include warnings if any
+                response = {
                     "status": "disconnected",
                     "success": True
                 }
-            else:
-                raise HTTPException(
-                    status_code=500, 
-                    detail="Failed to disconnect device after multiple attempts"
-                )
+                if cleanup_errors:
+                    response["warnings"] = cleanup_errors
+                return response
                 
-    except HTTPException as he:
-        raise he
+            else:
+                # Don't throw exception, return error status instead
+                return {
+                    "status": "failed",
+                    "success": False,
+                    "error": "Failed to disconnect device after multiple attempts"
+                }
+                
     except Exception as e:
-        print(f"Error during disconnect: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Error during disconnect process (non-fatal): {e}")
+        response = {
+            "status": "error",
+            "success": False,
+            "error": str(e)
+        }
     finally:
         try:
             print("\nEnsuring adapter is in clean state...")
-            # Basic adapter reset - these must succeed
-            safe_bt_command(["rfkill", "unblock", "bluetooth"], timeout=3)
-            safe_bt_command(["bluetoothctl", "power", "on"], timeout=3)
-            safe_bt_command(["bluetoothctl", "scan", "on"], timeout=3)
+            # Basic adapter reset - try each command separately
+            cleanup_commands = [
+                ("rfkill unblock", ["rfkill", "unblock", "bluetooth"]),
+                ("power on", ["bluetoothctl", "power", "on"]),
+                ("scan on", ["bluetoothctl", "scan", "on"])
+            ]
+            
+            for cmd_name, cmd in cleanup_commands:
+                try:
+                    safe_bt_command(cmd, timeout=3)
+                    await asyncio.sleep(0.5)
+                except Exception as cmd_error:
+                    print(f"Final {cmd_name} failed (non-fatal): {cmd_error}")
+                    
         except Exception as final_error:
-            print(f"Warning: Final cleanup had issues: {final_error}")
+            print(f"Warning: Final cleanup block failed (non-fatal): {final_error}")
+        
         print("=== Disconnect process complete ===\n")
+        return response  # Always return a response, never throw
 
 # --------------------------
 # Brightness
