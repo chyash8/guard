@@ -12,7 +12,7 @@ export function useVolume() {
 
     // Fetch initial volume state
     useEffect(() => {
-        fetch('http://localhost:5000/api/volume')
+        fetch('http://127.0.0.1:5000/api/volume')
             .then(res => res.json())
             .then(data => {
                 setVolume(data);

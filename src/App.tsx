@@ -8,7 +8,6 @@ import Index from "./pages/Index";
 import Settings from "./pages/Settings";
 import General from "./pages/settings/General";
 import Display from "./pages/settings/Display";
-import Bluetooth from "./pages/settings/Bluetooth";
 import WiFiSettings from "./pages/settings/WiFi";
 import About from "./pages/settings/About";
 import Help from "./pages/settings/Help";
@@ -29,7 +28,6 @@ const App = () => (
             <Route path="/settings" element={<Settings />} />
             <Route path="/settings/general" element={<General />} />
             <Route path="/settings/display" element={<Display />} />
-            <Route path="/settings/bluetooth" element={<Bluetooth />} />
             <Route path="/settings/wifi" element={<WiFiSettings />} />
             <Route path="/settings/about" element={<About />} />
             <Route path="/settings/help" element={<Help />} />

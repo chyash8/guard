@@ -5,13 +5,126 @@ import { Battery, Thermometer, Activity, Zap, QrCode, X } from "lucide-react";
 import Header from "@/components/Header";
 import BottomNav from "@/components/BottomNav";
 import PasswordDialog from "@/components/PasswordDialog";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
+import { socket } from "@/lib/socket";
+import { useToast } from "@/components/ui/use-toast";
+
+interface WifiStatus {
+  connected: boolean;
+  ssid: string | null;
+  signal: number | null;
+  error?: string;
+  status?: string;
+}
 
 const SystemStatus = () => {
   const [showQRModal, setShowQRModal] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
+  const [wifiStatus, setWifiStatus] = useState<WifiStatus | null>(null);
+  const [socketConnected, setSocketConnected] = useState(false);
+  const [lastUpdate, setLastUpdate] = useState<number>(Date.now());
+  const [retryCount, setRetryCount] = useState(0);
   const navigate = useNavigate();
+  const { toast } = useToast();
+
+  // Handle socket connection status and WiFi updates
+  useEffect(() => {
+    const handleConnect = () => {
+      setSocketConnected(true);
+      toast({
+        title: "System Connected",
+        description: "Connection to system established",
+        duration: 3000
+      });
+    };
+
+    const handleDisconnect = () => {
+      setSocketConnected(false);
+      toast({
+        title: "System Disconnected",
+        description: "Connection to system lost",
+        variant: "destructive",
+        duration: null // Keep showing until reconnected
+      });
+    };
+
+    const handleWifiStateChange = (data: { status: string, current_network: WifiStatus | null, timestamp: number }) => {
+      console.log('WiFi state change:', data);
+      setLastUpdate(data.timestamp * 1000); // Convert to milliseconds
+      
+      if (data.status === 'error') {
+        setWifiStatus(data.current_network);
+        toast({
+          title: "System Error",
+          description: data.current_network?.error || "Unknown error occurred",
+          variant: "destructive",
+          duration: 5000
+        });
+        return;
+      }
+      
+      if (data.current_network) {
+        setWifiStatus(data.current_network);
+        setRetryCount(0); // Reset retry count on successful update
+        
+        if (data.current_network.connected) {
+          toast({
+            title: "WiFi Connected",
+            description: `Connected to ${data.current_network.ssid}`,
+            duration: 3000
+          });
+        } else if (data.current_network.error) {
+          toast({
+            title: "WiFi Error",
+            description: data.current_network.error,
+            variant: "destructive",
+            duration: null // Keep showing until resolved
+          });
+        }
+      } else if (data.status === "off") {
+        setWifiStatus({
+          connected: false,
+          ssid: null,
+          signal: null,
+          status: "off"
+        });
+        toast({
+          title: "WiFi Disconnected",
+          description: "WiFi is turned off",
+          variant: "destructive",
+          duration: null // Keep showing until resolved
+        });
+      }
+    };
+
+    socket.on("connect", handleConnect);
+    socket.on("disconnect", handleDisconnect);
+    socket.on("wifi_state_change", handleWifiStateChange);
+
+    // Initial connection status
+    setSocketConnected(socket.connected);
+
+    // Initial WiFi status fetch
+    const fetchInitialStatus = async () => {
+      try {
+        const response = await fetch("/wifi/connection");
+        if (!response.ok) throw new Error("Failed to fetch WiFi status");
+        const data = await response.json();
+        setWifiStatus(data);
+      } catch (error) {
+        console.error("Error fetching initial WiFi status:", error);
+      }
+    };
+    
+    fetchInitialStatus();
+
+    return () => {
+      socket.off("connect", handleConnect);
+      socket.off("disconnect", handleDisconnect);
+      socket.off("wifi_state_change", handleWifiStateChange);
+    };
+  }, [toast]);
 
   const handlePasswordSuccess = () => {
     setShowPassword(false);
@@ -83,15 +196,32 @@ const SystemStatus = () => {
           </Card>
         </div>
         
-        <div className="grid grid-cols-3 gap-6 mb-8">
-          <div></div>
+          <div className="grid grid-cols-3 gap-6 mb-8">
+          <Card className="p-6 text-center">
+            <CardContent className="p-0">
+              <div className="mb-4">
+                <div className={`text-xl font-bold ${socketConnected ? 'text-success' : 'text-destructive'} mb-2`}>
+                  {socketConnected ? 'CONNECTED' : 'DISCONNECTED'}
+                </div>
+              </div>
+              <p className="text-muted-foreground font-bold">SYSTEM CONNECTION</p>
+            </CardContent>
+          </Card>
           
           <Card className="p-6 text-center">
             <CardContent className="p-0">
               <div className="mb-4">
-                <div className="text-xl font-bold text-success mb-2">ACTIVE</div>
+                <div className={`text-xl font-bold ${wifiStatus?.connected ? 'text-success' : 'text-destructive'} mb-2`}>
+                  {wifiStatus?.connected ? 'CONNECTED' : 'DISCONNECTED'}
+                </div>
+                {wifiStatus?.connected && wifiStatus.ssid && (
+                  <div className="text-sm text-muted-foreground">{wifiStatus.ssid}</div>
+                )}
+                {wifiStatus?.signal && (
+                  <div className="text-sm text-muted-foreground">Signal: {wifiStatus.signal}%</div>
+                )}
               </div>
-              <p className="text-muted-foreground font-bold">SYSTEM STATE</p>
+              <p className="text-muted-foreground font-bold">WIFI STATUS</p>
             </CardContent>
           </Card>
           
@@ -108,9 +238,7 @@ const SystemStatus = () => {
               </div>
             </CardContent>
           </Card>
-        </div>
-        
-        <div className="grid grid-cols-2 gap-6 mb-8">
+        </div>        <div className="grid grid-cols-2 gap-6 mb-8">
           <Card className="p-6 text-center">
             <CardContent className="p-0">
               <div className="mb-4">

@@ -4,7 +4,7 @@ from pydantic import BaseModel
 import subprocess
 import asyncio
 import time
-from bleak import BleakScanner, BleakClient
+import os
 import screen_brightness_control as sbc
 import alsaaudio
 import socketio
@@ -13,14 +13,22 @@ import socketio
 # Setup: Socket.IO + FastAPI
 # --------------------------
 
-sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*')
-fastapi_app = FastAPI(title="Jetson + Device API")
+sio = socketio.AsyncServer(
+    async_mode='asgi',
+    cors_allowed_origins=['http://127.0.0.1:8080', 'http://localhost:8080']
+)
+fastapi_app = FastAPI(
+    title="Jetson + Device API",
+    root_path="",
+    docs_url="/docs",
+    openapi_url="/openapi.json"
+)
 
-# CORS middleware
+# CORS middleware - only allow local connections
 fastapi_app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=["http://127.0.0.1:8080", "http://localhost:8080"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -37,9 +45,6 @@ class ToggleRequest(BaseModel):
 
 class VoiceChatRequest(BaseModel):
     action: str  # 'start' or 'stop'
-
-class ConnectRequest(BaseModel):
-    address: str
 
 class VolumeRequest(BaseModel):
     volume: int
@@ -90,684 +95,8 @@ async def set_volume(request: VolumeRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 # --------------------------
-# Bluetooth
+# Voice Chat
 # --------------------------
-
-def safe_bt_command(cmd, timeout=5):
-    """Safely run a bluetooth command with proper error handling"""
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        if result.returncode == 0:
-            return result
-    except subprocess.TimeoutExpired:
-        print(f"Command timed out: {cmd}")
-    except subprocess.CalledProcessError as e:
-        print(f"Command failed: {cmd}, error: {e}")
-    except Exception as e:
-        print(f"Unexpected error running command: {cmd}, error: {e}")
-    return None
-
-def safe_disconnect_device(address):
-    """Safely disconnect a bluetooth device with proper error handling"""
-    try:
-        # Try normal disconnect first
-        result = safe_bt_command(["bluetoothctl", "disconnect", address], timeout=5)
-        if result and "successful" in result.stdout.lower():
-            return True
-            
-        # If that fails, try power cycling
-        safe_bt_command(["bluetoothctl", "power", "off"], timeout=3)
-        time.sleep(1)
-        safe_bt_command(["bluetoothctl", "power", "on"], timeout=3)
-        time.sleep(1)
-        
-        # Try disconnect again
-        result = safe_bt_command(["bluetoothctl", "disconnect", address], timeout=5)
-        if result and "successful" in result.stdout.lower():
-            return True
-            
-        # If still not disconnected, try removing the device
-        safe_bt_command(["bluetoothctl", "remove", address], timeout=5)
-        return True
-    except Exception as e:
-        print(f"Error in safe_disconnect_device: {e}")
-        return False
-
-def bluetooth_on():
-    try:
-        # First unblock using rfkill
-        subprocess.run(["rfkill", "unblock", "bluetooth"], check=True)
-        
-        # Start the bluetooth service
-        subprocess.run(["systemctl", "start", "bluetooth"], check=True)
-        time.sleep(2)  # Give time for the service to start
-        
-        # Turn on using bluetoothctl
-        subprocess.run(["bluetoothctl", "power", "on"], check=True)
-        time.sleep(1)  # Give time for power on
-        
-        # Verify the status
-        status = bluetooth_status()
-        if status != "on":
-            raise Exception("Failed to turn Bluetooth on")
-            
-        return {"success": True}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-def bluetooth_off():
-    try:
-        # First try to disconnect any connected devices
-        try:
-            result = subprocess.run(["bluetoothctl", "info"], capture_output=True, text=True)
-            if "Connected: yes" in result.stdout:
-                for line in result.stdout.splitlines():
-                    if line.strip().startswith("Device "):
-                        device_address = line.strip().split()[1]
-                        subprocess.run(["bluetoothctl", "disconnect", device_address], 
-                                    check=True, capture_output=True)
-                time.sleep(1)  # Give time for disconnect
-        except:
-            pass  # Continue even if disconnect fails
-            
-        # Turn off using bluetoothctl
-        subprocess.run(["bluetoothctl", "power", "off"], check=True)
-        time.sleep(1)  # Give time for power off
-        
-        # Stop the bluetooth service
-        subprocess.run(["systemctl", "stop", "bluetooth"], check=True)
-        
-        # Block using rfkill
-        subprocess.run(["rfkill", "block", "bluetooth"], check=True)
-        time.sleep(1)  # Give time for blocking
-        
-        # Verify the status
-        status = bluetooth_status()
-        if status != "off":
-            raise Exception("Failed to turn Bluetooth off")
-            
-        return {"success": True}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-def bluetooth_status():
-    try:
-        # First check bluetooth service status
-        service_status = subprocess.run(
-            ["systemctl", "is-active", "bluetooth"],
-            capture_output=True,
-            text=True
-        ).stdout.strip()
-        
-        print(f"Bluetooth service status: {service_status}")
-        
-        if service_status != "active":
-            print("Bluetooth service is not active")
-            return "off"
-
-        # Then check rfkill status
-        rfkill_result = subprocess.run(
-            ["rfkill", "list", "bluetooth"],
-            capture_output=True,
-            text=True
-        )
-        print(f"rfkill output: {rfkill_result.stdout}")
-        
-        if "Soft blocked: yes" in rfkill_result.stdout:
-            print("Bluetooth is soft blocked")
-            return "off"
-            
-        # Finally check bluetoothctl power status
-        power_result = subprocess.run(
-            ["bluetoothctl", "show"],
-            capture_output=True,
-            text=True
-        )
-        print(f"bluetoothctl show output: {power_result.stdout}")
-        
-        if "Powered: yes" in power_result.stdout:
-            print("Bluetooth is powered on")
-            return "on"
-        elif "Powered: no" in power_result.stdout:
-            print("Bluetooth is powered off")
-            return "off"
-            
-        # If we can't determine the status definitively, check if adapter exists
-        if "Controller" in power_result.stdout:
-            print("Bluetooth controller found, assuming on")
-            return "on"
-            
-        print("Unable to determine bluetooth status definitively")
-        return "unknown"
-    except Exception as e:
-        print(f"Error checking bluetooth status: {e}")
-        return "unknown"
-
-# Global state management
-discovered_devices = {}
-last_scan_time = 0
-SCAN_INTERVAL = 30  # Minimum seconds between full scans
-active_scan_process = None
-scanning_lock = asyncio.Lock()  # To prevent concurrent scan operations
-
-def safe_run_sync(cmd, timeout=5, check=False):
-    """Safely run a command synchronously with timeout"""
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=check)
-        return result
-    except subprocess.TimeoutExpired:
-        print(f"Command timed out: {cmd}")
-        return None
-    except subprocess.CalledProcessError as e:
-        print(f"Command failed: {cmd}, error: {e}")
-        return None
-    except Exception as e:
-        print(f"Unexpected error running command: {cmd}, error: {e}")
-        return None
-
-async def stop_active_scan():
-    global active_scan_process
-    if active_scan_process:
-        try:
-            # First try to stop scan via bluetoothctl
-            subprocess.run(["bluetoothctl", "scan", "off"], check=True, timeout=5)
-            # Then terminate the process if it's still running
-            if active_scan_process.poll() is None:
-                active_scan_process.terminate()
-                await asyncio.sleep(0.5)
-                if active_scan_process.poll() is None:
-                    active_scan_process.kill()
-            active_scan_process = None
-        except Exception as e:
-            print(f"Error stopping scan: {e}")
-
-async def scan_devices(timeout: int = 5, force_scan: bool = False):
-    global discovered_devices, last_scan_time, active_scan_process
-    current_time = time.time()
-    
-    try:
-        # Use the lock to prevent concurrent scans
-        async with scanning_lock:
-            # Return cached devices if scan interval hasn't elapsed
-            if not force_scan and (current_time - last_scan_time) < SCAN_INTERVAL:
-                return list(discovered_devices.values())
-                
-            # Stop any existing scan first
-            await stop_active_scan()
-
-            # Stop any ongoing scan
-            subprocess.run(["bluetoothctl", "scan", "off"], capture_output=True)
-            
-            # Initialize devices dict
-            bt_devices = {}
-            
-            # First attempt to get detailed device info using bluetoothctl
-            try:
-                subprocess.run(["bluetoothctl", "scan", "on"], timeout=2)  # Start brief scan
-                result = subprocess.run(["bluetoothctl", "devices"], capture_output=True, text=True)
-                
-                for line in result.stdout.splitlines():
-                    if line.startswith("Device"):
-                        parts = line.split(" ", 2)  # Split into 3 parts: "Device", MAC, and Name
-                        if len(parts) >= 2:
-                            addr = parts[1]
-                            name = parts[2] if len(parts) > 2 else None
-                            bt_devices[addr] = {"name": name, "address": addr}
-            except Exception as e:
-                print(f"Bluetoothctl scan failed: {e}")
-
-            try:
-                # Then use BleakScanner for additional devices and details
-                devices = await BleakScanner.discover(timeout=timeout)
-                
-                # Update discovered devices with new information
-                for d in devices:
-                    device_info = discovered_devices.get(d.address, {
-                        "name": None,
-                        "address": d.address,
-                        "type": "Unknown",
-                        "last_seen": 0
-                    })
-                    
-                    # Update device info with new data
-                    if d.name:
-                        device_info["name"] = d.name
-                    elif bt_devices.get(d.address, {}).get("name"):
-                        device_info["name"] = bt_devices[d.address]["name"]
-                    
-                    # Try to determine device type from name if not already set
-                    if device_info["type"] == "Unknown" and device_info["name"]:
-                        name_lower = device_info["name"].lower()
-                        if any(keyword in name_lower for keyword in ["headphone", "speaker", "audio"]):
-                            device_info["type"] = "Audio Device"
-                        elif "mouse" in name_lower:
-                            device_info["type"] = "Mouse"
-                        elif "keyboard" in name_lower:
-                            device_info["type"] = "Keyboard"
-                        elif "phone" in name_lower:
-                            device_info["type"] = "Phone"
-                        elif any(keyword in name_lower for keyword in ["watch", "band", "fit"]):
-                            device_info["type"] = "Wearable"
-                    
-                    device_info["last_seen"] = current_time
-                    discovered_devices[d.address] = device_info
-                
-                # Add any devices from bluetoothctl that weren't found by BleakScanner
-                for addr, device in bt_devices.items():
-                    if addr not in discovered_devices:
-                        device["type"] = "Unknown"
-                        device["last_seen"] = current_time
-                        discovered_devices[addr] = device
-                
-                # Remove devices not seen in the last 5 minutes
-                stale_time = current_time - 300  # 5 minutes
-                discovered_devices = {
-                    addr: dev for addr, dev in discovered_devices.items()
-                    if dev["last_seen"] > stale_time
-                }
-                
-                last_scan_time = current_time
-                return list(discovered_devices.values())
-                
-            except Exception as e:
-                print(f"Error during BleakScanner discovery: {e}")
-                # If BleakScanner fails, return whatever devices we found from bluetoothctl
-                return [device for device in bt_devices.values()]
-                
-    except Exception as e:
-        print(f"Scan failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Scan failed: {str(e)}")
-
-async def connect_device(address: str):
-    print(f"\n=== Starting connection process for {address} ===")
-    try:
-        # Properly stop any active scanning
-        print("Stopping active scans...")
-        await stop_active_scan()
-        await asyncio.sleep(1)  # Give time for scan cleanup
-        
-        # Prepare adapter for connection
-        print("Preparing adapter...")
-        try:
-            # Ensure adapter is powered and ready
-            subprocess.run(["bluetoothctl", "power", "off"], check=True, timeout=5)
-            await asyncio.sleep(1)
-            subprocess.run(["bluetoothctl", "power", "on"], check=True, timeout=5)
-            await asyncio.sleep(1)
-            
-            # Set necessary modes for connection
-            subprocess.run(["bluetoothctl", "pairable", "on"], check=True, timeout=5)
-            subprocess.run(["bluetoothctl", "discoverable", "on"], check=True, timeout=5)
-            
-            print("Attempting connection with bluetoothctl...")
-            # First try bluetoothctl connection
-            subprocess.run(["bluetoothctl", "connect", address], check=True, timeout=15)
-            await asyncio.sleep(2)  # Give connection time to stabilize
-            
-            # Verify connection
-            result = subprocess.run(["bluetoothctl", "info", address], 
-                                  capture_output=True, text=True, timeout=5)
-            
-            if "Connected: yes" in result.stdout:
-                print("Bluetoothctl connection successful")
-                # Get device name if available
-                device_name = None
-                for line in result.stdout.splitlines():
-                    if line.strip().startswith("Name: "):
-                        device_name = line.split(": ", 1)[1]
-                        break
-                
-                return {
-                    "status": "connected",
-                    "address": address,
-                    "name": device_name
-                }
-                
-        except subprocess.CalledProcessError as e:
-            print(f"Bluetoothctl connection failed: {e}")
-        except subprocess.TimeoutExpired as e:
-            print(f"Bluetoothctl connection timed out: {e}")
-            
-        # If bluetoothctl failed, try BleakClient as backup
-        print("Attempting connection with BleakClient...")
-        try:
-            async with BleakClient(address, timeout=10.0) as client:
-                if client.is_connected:
-                    print("BleakClient connection successful")
-                    return {"status": "connected", "address": address}
-                print("BleakClient connection failed")
-                return {"status": "failed", "error": "Connection failed with both methods"}
-        except Exception as bleak_error:
-            print(f"BleakClient connection error: {bleak_error}")
-            return {"status": "failed", "error": str(bleak_error)}
-            
-    except Exception as e:
-        print(f"Connection process error: {e}")
-        return {"status": "failed", "error": str(e)}
-    finally:
-        try:
-            # Ensure scan is properly restarted
-            print("Restarting scan process...")
-            subprocess.run(["bluetoothctl", "scan", "off"], check=True, timeout=5)
-            await asyncio.sleep(1)
-            subprocess.run(["bluetoothctl", "scan", "on"], check=True, timeout=5)
-            print("Connection process complete")
-        except Exception as cleanup_error:
-            print(f"Error during connection cleanup: {cleanup_error}")
-            # Don't raise the error as it's cleanup code
-
-@fastapi_app.get("/bluetooth/status")
-def get_status():
-    try:
-        # Get the Bluetooth power status first
-        status = bluetooth_status()
-        
-        # If Bluetooth is off, return early
-        if status == "off":
-            return {"status": "off", "connected": False}
-            
-        # Check for connected devices using bluetoothctl info
-        result = subprocess.run(
-            ["bluetoothctl", "info"],
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        
-        connected_device = None
-        device_name = None
-        is_connected = False
-        
-        # Parse the bluetoothctl info output
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if line.startswith("Device "):
-                connected_device = line.split()[1]
-            elif line.startswith("Name: "):
-                device_name = line.split(": ", 1)[1]
-            elif line == "Connected: yes":
-                is_connected = True
-            elif line == "Connected: no":
-                is_connected = False
-
-        # Only consider device connected if both device is found AND Connected: yes
-        if not is_connected:
-            connected_device = None
-            device_name = None
-                    
-        # Print debug info
-        print(f"Bluetooth status: Power={status}, Connected={is_connected}, Device={connected_device}, Name={device_name}")
-            
-        return {
-            "status": status,
-            "connected": is_connected,
-            "device": connected_device if is_connected else None,
-            "device_name": device_name if is_connected else None
-        }
-    except subprocess.CalledProcessError as e:
-        print(f"Error running bluetoothctl info: {e}")
-        return {"status": bluetooth_status(), "connected": False}
-    except Exception as e:
-        print(f"Error getting Bluetooth status: {e}")
-        return {"status": bluetooth_status(), "connected": False}
-
-@fastapi_app.post("/bluetooth/toggle")
-async def toggle_bluetooth(req: ToggleRequest):
-    if req.state not in ["on", "off"]:
-        raise HTTPException(status_code=400, detail="Invalid state. Use 'on' or 'off'")
-    
-    # Check current status first
-    current = bluetooth_status()
-    if current == req.state:
-        return {"status": req.state, "message": f"Bluetooth is already {req.state}"}
-        
-    # Perform the toggle
-    if req.state == "on":
-        result = bluetooth_on()
-    else:
-        result = bluetooth_off()
-        
-    if not result["success"]:
-        raise HTTPException(status_code=500, detail=result["error"])
-        
-    # Verify the new status
-    await asyncio.sleep(2)  # Give time for the system to update
-    new_status = bluetooth_status()
-    
-    if new_status != req.state:
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Failed to set Bluetooth {req.state}. Current status: {new_status}"
-        )
-    
-    # Clear discovered devices when turning off
-    if req.state == "off":
-        global discovered_devices
-        discovered_devices = {}
-
-@fastapi_app.get("/bluetooth/scan")
-async def scan(force: bool = False):
-    # Use the force parameter or check scan interval
-    current_time = time.time()
-    force_scan = force or (current_time - last_scan_time) >= SCAN_INTERVAL
-    devices = await scan_devices(timeout=5, force_scan=force_scan)
-    return {"devices": devices}
-
-@fastapi_app.post("/bluetooth/connect")
-async def connect(req: ConnectRequest):
-    print(f"Starting connection to device: {req.address}")
-    try:
-        result = await connect_device(req.address)
-        if result["status"] != "connected":
-            raise HTTPException(status_code=500, detail=result.get("error"))
-        
-        # After successful connection, ensure the adapter state is properly maintained
-        try:
-            print("Setting up post-connection state...")
-            # Keep discovery on but reduce its aggressiveness
-            subprocess.run(["bluetoothctl", "discoverable", "on"], check=True, timeout=5)
-            subprocess.run(["bluetoothctl", "pairable", "on"], check=True, timeout=5)
-            
-            # Trust the device to maintain connection
-            subprocess.run(["bluetoothctl", "trust", req.address], check=True, timeout=5)
-            
-            # Restart scanning in a controlled way
-            subprocess.run(["bluetoothctl", "scan", "off"], check=True, timeout=5)
-            await asyncio.sleep(1)
-            subprocess.run(["bluetoothctl", "scan", "on"], check=True, timeout=5)
-            print("Post-connection setup complete")
-        except Exception as setup_error:
-            print(f"Warning: Post-connection setup had issues: {setup_error}")
-            # Don't fail the connection if post-setup has issues
-        
-        return result
-    except Exception as e:
-        print(f"Connection error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-async def run_bt_command(cmd, timeout=5, check=True, retry_count=3):
-    """Helper function to run bluetooth commands safely"""
-    for attempt in range(retry_count):
-        try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=check
-            )
-            return result
-        except subprocess.TimeoutExpired as e:
-            print(f"Command {cmd} timed out (attempt {attempt + 1}): {e}")
-            if attempt == retry_count - 1:
-                raise
-        except subprocess.CalledProcessError as e:
-            print(f"Command {cmd} failed (attempt {attempt + 1}): {e}")
-            if attempt == retry_count - 1:
-                raise
-        except Exception as e:
-            print(f"Unexpected error running {cmd} (attempt {attempt + 1}): {e}")
-            if attempt == retry_count - 1:
-                raise
-        await asyncio.sleep(1)
-    return None
-
-def safe_run_sync(cmd, timeout=5, check=False):
-    """Safely run a command synchronously with timeout"""
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=check)
-        return result
-    except subprocess.TimeoutExpired:
-        print(f"Command timed out: {cmd}")
-        return None
-    except subprocess.CalledProcessError as e:
-        print(f"Command failed: {cmd}, error: {e}")
-        return None
-    except Exception as e:
-        print(f"Unexpected error running command: {cmd}, error: {e}")
-        return None
-
-@fastapi_app.post("/bluetooth/disconnect")
-async def disconnect_bluetooth():
-    """Handle Bluetooth device disconnection with robust error handling"""
-    print("\n=== Starting disconnect process ===")
-    # Initialize response at the top level
-    response = {"status": "unknown", "success": False}
-    
-    try:
-        async with scanning_lock:  # Use lock for the main disconnect process
-            # Initial scan cleanup - don't throw on failure
-            print("Initial cleanup...")
-            try:
-                safe_bt_command(["bluetoothctl", "scan", "off"], timeout=3)
-                await asyncio.sleep(0.5)
-            except Exception as cleanup_error:
-                print(f"Initial cleanup warning (non-fatal): {cleanup_error}")
-            
-            # Get currently connected device info with error handling
-            print("Getting connected device info...")
-            device_info = {
-                'address': None,
-                'name': None,
-                'connected': False
-            }
-            
-            result = safe_bt_command(["bluetoothctl", "info"], timeout=5)
-            if result and result.stdout:
-                for line in result.stdout.splitlines():
-                    line = line.strip()
-                    if line.startswith("Device "):
-                        device_info['address'] = line.split()[1]
-                    elif line.startswith("Name: "):
-                        device_info['name'] = line.split(": ", 1)[1]
-                    elif line == "Connected: yes":
-                        device_info['connected'] = True
-            
-            if not (device_info['connected'] and device_info['address']):
-                print("No connected device found")
-                return {"status": "not_connected"}
-                
-            print(f"Found connected device: {device_info['name']} ({device_info['address']})")
-            
-            # Try to disconnect using our safe_disconnect_device helper
-            disconnect_success = safe_disconnect_device(device_info['address'])
-            
-            if disconnect_success:
-                print("\nDevice successfully disconnected, cleaning up...")
-                # Final cleanup steps - each step handled separately
-                cleanup_errors = []
-                
-                try:
-                    # Reset adapter state - each command separate with error handling
-                    cleanup_steps = [
-                        ("scan off", ["bluetoothctl", "scan", "off"]),
-                        ("power off", ["bluetoothctl", "power", "off"]),
-                        ("power on", ["bluetoothctl", "power", "on"]),
-                        ("pairable on", ["bluetoothctl", "pairable", "on"]),
-                        ("discoverable on", ["bluetoothctl", "discoverable", "on"]),
-                        ("scan on", ["bluetoothctl", "scan", "on"])
-                    ]
-                    
-                    for step_name, cmd in cleanup_steps:
-                        try:
-                            result = safe_bt_command(cmd, timeout=3)
-                            if not result:
-                                cleanup_errors.append(f"{step_name} failed")
-                            await asyncio.sleep(0.5)
-                        except Exception as step_error:
-                            print(f"Cleanup step '{step_name}' error (non-fatal): {step_error}")
-                            cleanup_errors.append(f"{step_name} error: {str(step_error)}")
-                            continue  # Continue with next step regardless of errors
-                    
-                    # Prepare status update for clients - will be sent even if some cleanup failed
-                    status_data = {
-                        "status": "on",  # Bluetooth is still on, just disconnected
-                        "connected": False,
-                        "device": None,
-                        "device_name": None,
-                        "last_device": {
-                            "address": device_info['address'],
-                            "name": device_info['name']
-                        }
-                    }
-                    
-                    # Try to notify clients - don't throw if it fails
-                    try:
-                        await sio.emit('bluetooth_state_change', status_data)
-                    except Exception as emit_error:
-                        print(f"Warning: Failed to notify clients (non-fatal): {emit_error}")
-                        cleanup_errors.append(f"Client notification failed: {str(emit_error)}")
-                    
-                except Exception as cleanup_error:
-                    print(f"Warning: Main cleanup block error (non-fatal): {cleanup_error}")
-                    cleanup_errors.append(f"General cleanup error: {str(cleanup_error)}")
-                
-                # Always return success if we got this far, but include warnings if any
-                response = {
-                    "status": "disconnected",
-                    "success": True
-                }
-                if cleanup_errors:
-                    response["warnings"] = cleanup_errors
-                return response
-                
-            else:
-                # Don't throw exception, return error status instead
-                return {
-                    "status": "failed",
-                    "success": False,
-                    "error": "Failed to disconnect device after multiple attempts"
-                }
-                
-    except Exception as e:
-        print(f"Error during disconnect process (non-fatal): {e}")
-        response = {
-            "status": "error",
-            "success": False,
-            "error": str(e)
-        }
-    finally:
-        try:
-            print("\nEnsuring adapter is in clean state...")
-            # Basic adapter reset - try each command separately
-            cleanup_commands = [
-                ("rfkill unblock", ["rfkill", "unblock", "bluetooth"]),
-                ("power on", ["bluetoothctl", "power", "on"]),
-                ("scan on", ["bluetoothctl", "scan", "on"])
-            ]
-            
-            for cmd_name, cmd in cleanup_commands:
-                try:
-                    safe_bt_command(cmd, timeout=3)
-                    await asyncio.sleep(0.5)
-                except Exception as cmd_error:
-                    print(f"Final {cmd_name} failed (non-fatal): {cmd_error}")
-                    
-        except Exception as final_error:
-            print(f"Warning: Final cleanup block failed (non-fatal): {final_error}")
-        
-        print("=== Disconnect process complete ===\n")
-        return response  # Always return a response, never throw
 
 # --------------------------
 # Brightness
@@ -807,9 +136,9 @@ def wifi_scan():
         if status["status"] == "off":
             return {"networks": [], "status": "off"}
 
-        # Get detailed network info including security
+        # Get network info including security
         result = subprocess.run(
-            ["nmcli", "-t", "-f", "SSID,SIGNAL,SECURITY", "dev", "wifi", "list"],
+            ["nmcli", "-t", "-f", "SSID,SECURITY", "dev", "wifi", "list"],
             capture_output=True,
             text=True,
             check=True
@@ -821,15 +150,13 @@ def wifi_scan():
         for line in result.stdout.strip().split('\n'):
             if line:
                 parts = line.split(":")
-                if len(parts) >= 3:
+                if len(parts) >= 2:
                     ssid = parts[0].strip()
-                    signal = int(parts[1]) if parts[1].isdigit() else 0
-                    security = parts[2] if parts[2] else "--"
+                    security = parts[1] if parts[1] else "--"
                     
                     if ssid:  # skip empty SSID rows
                         network = {
                             "ssid": ssid,
-                            "signal": signal,
                             "security": security
                         }
                         # Mark if this is the current network
@@ -842,75 +169,167 @@ def wifi_scan():
         print(f"Scan error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+def ensure_network_manager():
+    """Ensure NetworkManager is running and responding"""
+    try:
+        # Check if NetworkManager is running
+        nm_status = subprocess.run(
+            ["systemctl", "is-active", "NetworkManager"],
+            capture_output=True,
+            text=True
+        )
+        
+        if nm_status.stdout.strip() != "active":
+            print("NetworkManager is not running, attempting to start...")
+            subprocess.run(["sudo", "systemctl", "start", "NetworkManager"], check=True)
+            time.sleep(2)  # Give it time to start
+            
+        # Verify NetworkManager is responding
+        test_cmd = subprocess.run(
+            ["nmcli", "general", "status"],
+            capture_output=True,
+            text=True
+        )
+        
+        if test_cmd.returncode != 0:
+            print("NetworkManager not responding, attempting to restart...")
+            subprocess.run(["sudo", "systemctl", "restart", "NetworkManager"], check=True)
+            time.sleep(3)  # Give it time to restart
+            
+        return True
+    except Exception as e:
+        print(f"Failed to ensure NetworkManager is running: {e}")
+        return False
+
 @fastapi_app.get("/wifi/connection")
 def current_wifi():
     try:
-        # Get current WiFi status first
-        if wifi_status()["status"] != "on":
-            return {"connected": False, "ssid": None, "signal": None}
+        # First ensure NetworkManager is running
+        if not ensure_network_manager():
+            return {"connected": False, "ssid": None, "signal": None, "error": "NetworkManager not available"}
+        
+        # Get current WiFi status
+        wifi_state = wifi_status()
+        if wifi_state["status"] != "on":
+            return {"connected": False, "ssid": None, "signal": None, "status": wifi_state["status"]}
         
         # Get all active connections with detailed info
         connection_result = subprocess.run(
-            ["nmcli", "-t", "-f", "TYPE,NAME,DEVICE", "connection", "show", "--active"],
+            ["nmcli", "-t", "-f", "TYPE,NAME,DEVICE,STATE", "connection", "show", "--active"],
             capture_output=True,
-            text=True,
-            check=True
+            text=True
         )
+        
+        if connection_result.returncode != 0:
+            print("Error getting active connections:", connection_result.stderr)
+            return {"connected": False, "ssid": None, "signal": None, "error": "Failed to get connections"}
         
         wifi_connection = None
         wifi_device = None
+        connection_state = None
         
         # Find active WiFi connection
         for line in connection_result.stdout.strip().split('\n'):
             if line:
                 try:
-                    conn_type, name, device = line.strip().split(':')
-                    if conn_type == "802-11-wireless" or device.startswith('wl'):
-                        wifi_connection = name
-                        wifi_device = device
-                        break
-                except ValueError:
+                    parts = line.strip().split(':')
+                    if len(parts) >= 4:
+                        conn_type, name, device, state = parts[:4]
+                        if (conn_type == "802-11-wireless" or device.startswith('wl')) and state == "activated":
+                            wifi_connection = name
+                            wifi_device = device
+                            connection_state = state
+                            break
+                except (ValueError, IndexError):
                     continue
         
         if not wifi_connection:
-            return {"connected": False, "ssid": None, "signal": None}
+            # No active WiFi connection found
+            # Check if WiFi is enabled but not connected
+            device_status = subprocess.run(
+                ["nmcli", "device", "status"],
+                capture_output=True,
+                text=True
+            )
+            
+            if device_status.returncode == 0:
+                for line in device_status.stdout.split('\n'):
+                    if 'wifi' in line.lower():
+                        status_parts = line.split()
+                        if len(status_parts) >= 3:
+                            status = status_parts[2].lower()
+                            if status == "disconnected":
+                                return {
+                                    "connected": False,
+                                    "ssid": None,
+                                    "status": "disconnected",
+                                    "device": status_parts[0]
+                                }
+            return {"connected": False, "ssid": None}
         
         # Get detailed info about the current connection
         detail_result = subprocess.run(
-            ["nmcli", "-t", "-f", "all", "device", "wifi"],
+            ["nmcli", "-t", "-f", "SSID,SIGNAL,SECURITY", "device", "wifi", "list"],
             capture_output=True,
-            text=True,
-            check=True
+            text=True
         )
         
-        for line in detail_result.stdout.strip().split('\n'):
-            fields = line.strip().split(':')
-            if len(fields) >= 4 and fields[0] == "*":  # '*' indicates current connection
-                return {
-                    "connected": True,
-                    "ssid": fields[1],
-                    "signal": int(fields[2]) if fields[2].isdigit() else None,
-                    "security": fields[3] if len(fields) > 3 else "--",
-                    "device": wifi_device
-                }
+        if detail_result.returncode == 0:
+            current_details = None
+            for line in detail_result.stdout.strip().split('\n'):
+                fields = line.strip().split(':')
+                if len(fields) >= 3 and fields[0] == wifi_connection:
+                    current_details = {
+                        "connected": True,
+                        "ssid": fields[0],
+                        "security": fields[2] if len(fields) > 2 else "--",
+                        "device": wifi_device,
+                        "state": connection_state
+                    }
+                    break
+            
+            if current_details:
+                return current_details
         
-        # Fallback if we found a connection but couldn't get details
+        # Fallback if we couldn't get detailed info
         return {
             "connected": True,
             "ssid": wifi_connection,
-            "signal": None,
             "security": "--",
-            "device": wifi_device
+            "device": wifi_device,
+            "state": connection_state
         }
-            
     except Exception as e:
         print(f"Error getting WiFi connection: {str(e)}")
-        return {"connected": False, "ssid": None, "signal": None}
+        return {
+            "connected": False,
+            "ssid": None,
+            "error": str(e)
+        }
 
 @fastapi_app.get("/wifi/status")
 def wifi_status():
     try:
-        # First check if the wifi hardware is blocked
+        # First check if NetworkManager is running
+        nm_status = subprocess.run(
+            ["systemctl", "is-active", "NetworkManager"],
+            capture_output=True,
+            text=True
+        )
+        
+        if nm_status.stdout.strip() != "active":
+            print("NetworkManager is not running")
+            try:
+                # Try to start NetworkManager
+                subprocess.run(["sudo", "systemctl", "start", "NetworkManager"], check=True)
+                print("Started NetworkManager")
+                # Give it a moment to initialize
+                time.sleep(2)
+            except Exception as nm_err:
+                print(f"Failed to start NetworkManager: {nm_err}")
+                return {"status": "error", "reason": "NetworkManager not running"}
+                
+        # Check if the wifi hardware is blocked
         rfkill = subprocess.run(
             ["rfkill", "list", "wifi"],
             capture_output=True,
@@ -918,7 +337,13 @@ def wifi_status():
         )
         
         if "Soft blocked: yes" in rfkill.stdout:
-            return {"status": "off", "reason": "blocked"}
+            print("WiFi is soft blocked, attempting to unblock...")
+            try:
+                subprocess.run(["rfkill", "unblock", "wifi"], check=True)
+                time.sleep(1)  # Give it a moment
+            except Exception as unblock_err:
+                print(f"Failed to unblock WiFi: {unblock_err}")
+                return {"status": "off", "reason": "blocked"}
             
         # Then check nmcli status
         result = subprocess.run(
@@ -929,9 +354,18 @@ def wifi_status():
         
         if result.returncode == 0:
             status = result.stdout.strip().lower()
+            if status != "enabled":
+                print("WiFi radio is disabled, attempting to enable...")
+                try:
+                    subprocess.run(["nmcli", "radio", "wifi", "on"], check=True)
+                    time.sleep(1)  # Give it a moment
+                    return {"status": "on", "message": "WiFi radio enabled"}
+                except Exception as radio_err:
+                    print(f"Failed to enable WiFi radio: {radio_err}")
+                    
             return {"status": "on" if status == "enabled" else "off"}
             
-        # If nmcli failed, try checking device status directly
+        # If nmcli command failed, check device status directly
         dev_status = subprocess.run(
             ["nmcli", "device", "status"],
             capture_output=True,
@@ -939,71 +373,162 @@ def wifi_status():
         )
         
         if dev_status.returncode == 0:
-            # Look for any wifi device that's not unavailable
+            wifi_found = False
             for line in dev_status.stdout.split('\n'):
-                if 'wifi' in line.lower() and 'unavailable' not in line.lower():
-                    return {"status": "on"}
+                if 'wifi' in line.lower():
+                    wifi_found = True
+                    if 'unavailable' in line.lower():
+                        print("WiFi device is unavailable, checking hardware...")
+                        # Try to bring up the WiFi interface
+                        try:
+                            interfaces = subprocess.run(
+                                ["ip", "link", "show"],
+                                capture_output=True,
+                                text=True
+                            )
+                            for iface_line in interfaces.stdout.split('\n'):
+                                if 'wlan' in iface_line.lower() or 'wifi' in iface_line.lower():
+                                    iface_name = iface_line.split(':')[1].strip()
+                                    subprocess.run(["sudo", "ip", "link", "set", iface_name, "up"], check=True)
+                                    time.sleep(2)  # Give interface time to come up
+                                    return {"status": "on", "message": f"Enabled interface {iface_name}"}
+                        except Exception as iface_err:
+                            print(f"Failed to bring up WiFi interface: {iface_err}")
+                    else:
+                        return {"status": "on"}
+                        
+            if not wifi_found:
+                return {"status": "error", "reason": "No WiFi device found"}
                     
         return {"status": "off", "reason": "unavailable"}
         
     except Exception as e:
         print(f"Error checking WiFi status: {str(e)}")
-        # Don't raise an exception, just return off status
-        return {"status": "off", "reason": str(e)}
+        return {"status": "error", "reason": str(e)}
 
 @fastapi_app.post("/wifi/toggle")
 async def toggle_wifi(req: ToggleRequest):
+    print(f"Received toggle request with state: {req.state}")
+    
+    if req.state not in ["on", "off"]:
+        raise HTTPException(status_code=400, detail="Invalid state. Use 'on' or 'off'")
+    
     try:
-        if req.state not in ["on", "off"]:
-            raise HTTPException(status_code=400, detail="Invalid state. Use 'on' or 'off'")
-        
-        # First check current status
-        current_status = wifi_status()
-        if current_status["status"] == "on" and req.state == "on":
-            return {"status": "on", "message": "WiFi is already on"}
-        if current_status["status"] == "off" and req.state == "off":
-            return {"status": "off", "message": "WiFi is already off"}
-            
-        # Execute the toggle command
-        result = subprocess.run(
-            ["nmcli", "radio", "wifi", req.state],
-            capture_output=True,
-            text=True
-        )
-        
-        if result.returncode != 0:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to toggle WiFi: {result.stderr}"
+        if req.state == "off":
+            # First, disconnect from any active WiFi connections
+            try:
+                current = current_wifi()
+                if current.get("connected") and current.get("device"):
+                    print(f"Disconnecting from current network on device {current['device']}")
+                    subprocess.run(
+                        ["sudo", "nmcli", "device", "disconnect", current["device"]],
+                        capture_output=True,
+                        text=True,
+                        check=True
+                    )
+                    await asyncio.sleep(1)
+            except Exception as e:
+                print(f"Warning: Error during disconnect: {e}")
+
+            # Disable WiFi in NetworkManager and prevent auto-connections
+            print("Disabling NetworkManager WiFi and auto-connections...")
+            try:
+                # Disable WiFi radio
+                subprocess.run(
+                    ["sudo", "nmcli", "radio", "wifi", "off"],
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                
+                # Disable NetworkManager's WiFi auto-connect feature
+                subprocess.run(
+                    ["sudo", "nmcli", "general", "wifi", "off"],
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+            except Exception as e:
+                print(f"Warning: Error configuring NetworkManager: {e}")
+
+            # Finally, use rfkill to block WiFi at hardware level
+            print("Blocking WiFi at hardware level...")
+            subprocess.run(
+                ["sudo", "rfkill", "block", "wifi"],
+                capture_output=True,
+                text=True,
+                check=True
             )
+        else:  # req.state == "on"
+            # First unblock at hardware level
+            print("Unblocking WiFi at hardware level...")
+            subprocess.run(
+                ["sudo", "rfkill", "unblock", "wifi"],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            await asyncio.sleep(1)
+
+            # Then enable in NetworkManager
+            print("Enabling WiFi in NetworkManager...")
+            subprocess.run(
+                ["sudo", "nmcli", "radio", "wifi", "on"],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+
+            # Re-enable auto-connections if turning on
+            subprocess.run(
+                ["sudo", "nmcli", "general", "wifi", "on"],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+
+        print(f"WiFi {req.state} commands completed")
         
-        # Give the system time to update the WiFi state
-        await asyncio.sleep(2)
+        # Wait for changes to take effect
+        await asyncio.sleep(3)
         
         # Get the updated status
         status = wifi_status()
         current = None
         if status["status"] == "on":
-            current = current_wifi()
-            
-        # Emit the state change to all connected clients
+            try:
+                current = current_wifi()
+            except Exception as e:
+                print(f"Error getting current WiFi status: {e}")
+        
+        # Double-check if WiFi is really off when requested
+        if req.state == "off" and status["status"] == "on":
+            # Try one more time with more aggressive approach
+            try:
+                subprocess.run(["sudo", "rfkill", "block", "all"], check=True)
+                subprocess.run(["sudo", "nmcli", "radio", "all", "off"], check=True)
+                await asyncio.sleep(1)
+                status = wifi_status()
+            except Exception as e:
+                print(f"Warning: Error during aggressive WiFi disable: {e}")
+
+        # Notify all clients
         await sio.emit('wifi_state_change', {
             'status': status["status"],
-            'current_network': current
+            'current_network': current,
+            'timestamp': time.time()
         })
         
         return {"status": status["status"]}
-            
+        
     except subprocess.CalledProcessError as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to toggle WiFi: {str(e)}"
-        )
+        error_msg = f"Failed to toggle WiFi: {str(e)}"
+        print(error_msg)
+        raise HTTPException(status_code=500, detail=error_msg)
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Unexpected error while toggling WiFi: {str(e)}"
-        )
+        error_msg = f"Unexpected error while toggling WiFi: {str(e)}"
+        print(error_msg)
+        raise HTTPException(status_code=500, detail=error_msg)
 
 @fastapi_app.post("/wifi/connect")
 async def connect_wifi(req: WifiConnectRequest):
@@ -1072,23 +597,64 @@ async def disconnect_wifi():
         if not current["connected"]:
             return {"status": "not_connected"}
             
+        # Store device info for reconnection
+        device = current.get("device")
+        
+        # Try to notify clients before disconnecting
+        try:
+            await sio.emit('wifi_state_change', {
+                'status': "disconnecting",
+                'current_network': None
+            })
+        except Exception as notify_err:
+            print(f"Warning: Could not notify clients before disconnect: {notify_err}")
+            
         # Disconnect from WiFi
         result = subprocess.run(
-            ["nmcli", "device", "disconnect", current["device"]],
+            ["nmcli", "device", "disconnect", device] if device else ["nmcli", "connection", "down", current["ssid"]],
             capture_output=True,
             text=True,
             check=True
         )
         
-        # Notify clients about disconnection
-        await sio.emit('wifi_state_change', {
-            'status': "on",
-            'current_network': None
-        })
+        # Brief pause to let the disconnection take effect
+        await asyncio.sleep(1)
         
-        return {"status": "disconnected"}
+        # Start monitoring connection status
+        retry_count = 0
+        max_retries = 3
+        while retry_count < max_retries:
+            try:
+                # Check if actually disconnected
+                current_check = current_wifi()
+                if not current_check["connected"]:
+                    return {"status": "disconnected"}
+                    
+                # If still connected, try again
+                if retry_count < max_retries - 1:
+                    print(f"Still connected after disconnect attempt {retry_count + 1}, retrying...")
+                    subprocess.run(
+                        ["nmcli", "device", "disconnect", device] if device else ["nmcli", "connection", "down", current["ssid"]],
+                        capture_output=True,
+                        text=True,
+                        check=True
+                    )
+                    await asyncio.sleep(1)
+                    
+            except Exception as check_err:
+                print(f"Error checking connection status: {check_err}")
+                
+            retry_count += 1
+            
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to confirm disconnection after multiple attempts"
+        )
+            
     except subprocess.CalledProcessError as e:
         raise HTTPException(status_code=500, detail=f"Failed to disconnect: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unexpected error during disconnect: {str(e)}")
 
 
 
@@ -1121,30 +687,133 @@ async def voice_chat_status():
 # Socket.IO
 # --------------------------
 
+# Store connected clients
+connected_clients = set()
+
+# Background task to monitor WiFi status
+async def monitor_wifi_status():
+    previous_status = None
+    previous_connection = None
+    consecutive_errors = 0
+    max_consecutive_errors = 3
+    
+    while True:
+        try:
+            # Always force a NetworkManager check
+            ensure_network_manager()
+            
+            wifi_state = wifi_status()
+            current = None
+            
+            # Always try to get current connection info, even if status appears off
+            try:
+                current = current_wifi()
+            except Exception as conn_err:
+                print(f"Error getting current connection: {conn_err}")
+                
+            # More comprehensive status change detection
+            status_changed = (
+                previous_status != wifi_state["status"] or
+                previous_connection is None or current is None or
+                (current is not None and previous_connection is not None and
+                 (current.get("connected") != previous_connection.get("connected") or
+                  current.get("ssid") != previous_connection.get("ssid") or
+                  current.get("signal") != previous_connection.get("signal") or
+                  current.get("error") != previous_connection.get("error")))
+            )
+            
+            if status_changed or consecutive_errors >= max_consecutive_errors:
+                print(f"WiFi status changed: {wifi_state['status']}, Connection: {current}")
+                
+                # Broadcast to all connected clients
+                if len(connected_clients) > 0:
+                    await sio.emit('wifi_state_change', {
+                        'status': wifi_state["status"],
+                        'current_network': current,
+                        'timestamp': time.time()
+                    })
+                
+                previous_status = wifi_state["status"]
+                previous_connection = current
+                consecutive_errors = 0  # Reset error counter on successful update
+                
+        except Exception as e:
+            consecutive_errors += 1
+            print(f"Error in WiFi monitor (attempt {consecutive_errors}): {e}")
+            
+            if consecutive_errors >= max_consecutive_errors:
+                # After several errors, notify clients of the problem
+                if len(connected_clients) > 0:
+                    await sio.emit('wifi_state_change', {
+                        'status': 'error',
+                        'current_network': {
+                            'connected': False,
+                            'ssid': None,
+                            'signal': None,
+                            'error': f"System error: {str(e)}"
+                        },
+                        'timestamp': time.time()
+                    })
+                
+                # Wait longer between retries after repeated errors
+                await asyncio.sleep(5)
+            
+        # Adaptive sleep: shorter interval if there are clients connected
+        await asyncio.sleep(1 if connected_clients else 3)
+
 @sio.event
 async def connect(sid, environ):
     print(f"Socket.IO client connected: {sid}")
+    connected_clients.add(sid)
     try:
+        # Ensure NetworkManager is running
+        ensure_network_manager()
+        
         # Get current WiFi status
         wifi_state = wifi_status()
         current = None
-        if wifi_state["status"] == "on":
+        
+        # Always try to get current connection info
+        try:
             current = current_wifi()
+        except Exception as conn_err:
+            print(f"Error getting initial connection state: {conn_err}")
+            current = {
+                'connected': False,
+                'ssid': None,
+                'signal': None,
+                'error': str(conn_err)
+            }
+            
+        # Send initial state to the new client
         await sio.emit('wifi_state_change', {
             'status': wifi_state["status"],
-            'current_network': current
+            'current_network': current,
+            'timestamp': time.time()
         }, to=sid)
         
-        # Get current Bluetooth status and emit to the new client
-        bt_status = get_status()
-        print(f"Sending initial Bluetooth status to client {sid}:", bt_status)
-        await sio.emit('bluetooth_state_change', bt_status, to=sid)
+        print(f"Sent initial state to {sid}: {wifi_state['status']}, {current}")
         
-        # Also broadcast current status to all clients to ensure sync
-        await sio.emit('bluetooth_state_change', bt_status)
     except Exception as e:
-        print(f"Error sending initial states: {e}")
+        print(f"Error sending initial states to {sid}: {e}")
+        # Send error state to client
+        await sio.emit('wifi_state_change', {
+            'status': 'error',
+            'current_network': {
+                'connected': False,
+                'ssid': None,
+                'signal': None,
+                'error': f"System error: {str(e)}"
+            },
+            'timestamp': time.time()
+        }, to=sid)
 
 @sio.event
 async def disconnect(sid):
     print(f"Socket.IO client disconnected: {sid}")
+    connected_clients.discard(sid)  # Remove from connected clients set
+
+# Start WiFi monitor when app starts
+@fastapi_app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(monitor_wifi_status())

@@ -15,7 +15,6 @@ const SettingsLayout = ({ children }: SettingsLayoutProps) => {
   const menuItems = [
     { label: "GENERAL", path: "/settings/general" },
     { label: "DISPLAY", path: "/settings/display" },
-    { label: "BLUETOOTH", path: "/settings/bluetooth" },
     { label: "WiFi", path: "/settings/wifi" },
     { label: "ABOUT", path: "/settings/about" },
     { label: "GET HELP", path: "/settings/help" },

@@ -15,7 +15,7 @@ export function VolumeControl() {
         fetchVolume()
     }, [])
 
-    const JETSON_API = "http://192.168.0.101:5000"
+    const JETSON_API = "http://127.0.0.1:5000"
 
     const fetchVolume = async () => {
         try {

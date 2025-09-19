@@ -4,20 +4,11 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Wifi, Lock, Unlock, Loader2, Check, X } from "lucide-react";
 import { useEffect, useState } from "react";
-import { io } from "socket.io-client";
-
-// Jetson server URL
-const BACKEND_URL = "http://192.168.0.101:5000";
-
-// Initialize WebSocket connection
-const socket = io(BACKEND_URL, {
-  transports: ["websocket"],
-  autoConnect: false,
-});
+import { socket } from "@/lib/socket";
+import { API_URL } from "@/lib/config";
 
 type Network = {
   ssid: string;
-  signal: number;
   security: string;
 };
 
@@ -35,9 +26,7 @@ const WiFiSettings = () => {
 
   // WebSocket & initial fetch setup
   useEffect(() => {
-    socket.connect();
-
-    socket.on("wifi_state_change", (data) => {
+    const handleWifiState = (data: any) => {
       const isWifiOn = data.status === "on";
       setIsEnabled(isWifiOn);
       
@@ -50,7 +39,9 @@ const WiFiSettings = () => {
       } else {
         setCurrentConnection(data.current_network);
       }
-    });
+    };
+
+    socket.on("wifi_state_change", handleWifiState);
 
     socket.on("connect", () => {
       console.log("WebSocket connected");
@@ -64,7 +55,7 @@ const WiFiSettings = () => {
 
     const fetchStatus = async () => {
       try {
-        const res = await fetch(`${BACKEND_URL}/wifi/status`);
+        const res = await fetch(`${API_URL}/wifi/status`);
         const data = await res.json();
         setIsEnabled(data.status === "on");
 
@@ -89,7 +80,7 @@ const WiFiSettings = () => {
 
   const fetchCurrentConnection = async () => {
     try {
-      const res = await fetch(`${BACKEND_URL}/wifi/connection`);
+      const res = await fetch(`${API_URL}/wifi/connection`);
       if (res.ok) {
         const data = await res.json();
         setCurrentConnection(data.connected ? data : null);
@@ -104,7 +95,9 @@ const WiFiSettings = () => {
     setError(null);
     try {
       const state = checked ? "on" : "off";
-      const res = await fetch(`${BACKEND_URL}/wifi/toggle`, {
+      console.log(`Sending WiFi toggle request with state: ${state}`);
+      setIsEnabled(checked); // Optimistically update the UI
+      const res = await fetch(`${API_URL}/wifi/toggle`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ state })
@@ -132,7 +125,7 @@ const WiFiSettings = () => {
     const scanNetworks = async () => {
       setScanning(true);
       try {
-        const res = await fetch(`${BACKEND_URL}/wifi/scan`);
+        const res = await fetch(`${API_URL}/wifi/scan`);
         const data = await res.json();
         
         // If WiFi is off, clear networks and return
@@ -170,7 +163,7 @@ const WiFiSettings = () => {
     setConnectingTo(network.ssid);
     setError(null);
     try {
-      const res = await fetch(`${BACKEND_URL}/wifi/connect`, {
+      const res = await fetch(`${API_URL}/wifi/connect`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -203,7 +196,7 @@ const WiFiSettings = () => {
     setDisconnecting(true);
     setError(null);
     try {
-      const res = await fetch(`${BACKEND_URL}/wifi/disconnect`, { method: "POST" });
+      const res = await fetch(`${API_URL}/wifi/disconnect`, { method: "POST" });
       if (res.ok) {
         setCurrentConnection(null);
       } else {
@@ -268,9 +261,8 @@ const WiFiSettings = () => {
                         {currentConnection.ssid}
                       </h4>
                       <p className="text-sm text-green-600">
-                        Signal: {currentConnection.signal}%{" "}
                         {currentConnection.security !== "--" && (
-                          <span>• 🔒 {currentConnection.security}</span>
+                          <span>🔒 {currentConnection.security}</span>
                         )}
                       </p>
                     </div>
@@ -321,7 +313,6 @@ const WiFiSettings = () => {
                           {network.ssid || "(Hidden SSID)"}
                         </span>
                         <p className="text-sm text-gray-500">
-                          Signal: {network.signal}% •{" "}
                           {network.security !== "--"
                             ? `🔒 ${network.security}`
                             : "🔓 Open"}
