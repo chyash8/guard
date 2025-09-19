@@ -412,7 +412,7 @@ async def toggle_wifi(req: ToggleRequest):
     
     if req.state not in ["on", "off"]:
         raise HTTPException(status_code=400, detail="Invalid state. Use 'on' or 'off'")
-    
+
     try:
         if req.state == "off":
             # First, disconnect from any active WiFi connections
@@ -426,32 +426,12 @@ async def toggle_wifi(req: ToggleRequest):
                         text=True,
                         check=True
                     )
-                    await asyncio.sleep(1)
             except Exception as e:
                 print(f"Warning: Error during disconnect: {e}")
 
-            # Disable WiFi in NetworkManager and prevent auto-connections
-            print("Disabling NetworkManager WiFi and auto-connections...")
-            try:
-                # Disable WiFi radio
-                subprocess.run(
-                    ["sudo", "nmcli", "radio", "wifi", "off"],
-                    capture_output=True,
-                    text=True,
-                    check=True
-                )
-                
-                # Disable NetworkManager's WiFi auto-connect feature
-                subprocess.run(
-                    ["sudo", "nmcli", "general", "wifi", "off"],
-                    capture_output=True,
-                    text=True,
-                    check=True
-                )
-            except Exception as e:
-                print(f"Warning: Error configuring NetworkManager: {e}")
+            await asyncio.sleep(1)
 
-            # Finally, use rfkill to block WiFi at hardware level
+            # First, use rfkill to block WiFi at hardware level
             print("Blocking WiFi at hardware level...")
             subprocess.run(
                 ["sudo", "rfkill", "block", "wifi"],
@@ -459,6 +439,16 @@ async def toggle_wifi(req: ToggleRequest):
                 text=True,
                 check=True
             )
+
+            # Then disable in NetworkManager
+            print("Disabling NetworkManager WiFi...")
+            subprocess.run(
+                ["sudo", "nmcli", "radio", "wifi", "off"],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+
         else:  # req.state == "on"
             # First unblock at hardware level
             print("Unblocking WiFi at hardware level...")
@@ -468,20 +458,13 @@ async def toggle_wifi(req: ToggleRequest):
                 text=True,
                 check=True
             )
+
             await asyncio.sleep(1)
 
             # Then enable in NetworkManager
             print("Enabling WiFi in NetworkManager...")
             subprocess.run(
                 ["sudo", "nmcli", "radio", "wifi", "on"],
-                capture_output=True,
-                text=True,
-                check=True
-            )
-
-            # Re-enable auto-connections if turning on
-            subprocess.run(
-                ["sudo", "nmcli", "general", "wifi", "on"],
                 capture_output=True,
                 text=True,
                 check=True
@@ -662,7 +645,7 @@ async def disconnect_wifi():
 # Voice Chat
 # --------------------------
 
-from process_manager import voice_chat_manager
+from .process_manager import voice_chat_manager
 
 @fastapi_app.post("/voice-chat/control")
 async def control_voice_chat(request: VoiceChatRequest):
