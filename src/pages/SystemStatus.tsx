@@ -25,6 +25,8 @@ const SystemStatus = () => {
   const [socketConnected, setSocketConnected] = useState(false);
   const [lastUpdate, setLastUpdate] = useState<number>(Date.now());
   const [retryCount, setRetryCount] = useState(0);
+  const [cpuTemp, setCpuTemp] = useState<number | null>(null);
+  const [gpuTemp, setGpuTemp] = useState<number | null>(null);
   const navigate = useNavigate();
   const { toast } = useToast();
 
@@ -105,6 +107,26 @@ const SystemStatus = () => {
     // Initial connection status
     setSocketConnected(socket.connected);
 
+    // System temperature monitoring
+    const fetchTemperatures = async () => {
+      try {
+        console.log("Fetching temperatures..."); // Debug log
+        const response = await fetch("http://localhost:5000/system/temperature");
+        console.log("Response status:", response.status); // Debug log
+        if (!response.ok) throw new Error("Failed to fetch temperatures");
+        const data = await response.json();
+        console.log("Temperature data received:", data); // Debug log
+        setCpuTemp(data.cpu);
+        setGpuTemp(data.gpu);
+      } catch (error) {
+        console.error("Error fetching temperatures:", error);
+      }
+    };
+
+    // Set up temperature polling
+    const tempInterval = setInterval(fetchTemperatures, 2000); // Update every 2 seconds
+    fetchTemperatures(); // Initial fetch
+
     // Initial WiFi status fetch
     const fetchInitialStatus = async () => {
       try {
@@ -123,6 +145,7 @@ const SystemStatus = () => {
       socket.off("connect", handleConnect);
       socket.off("disconnect", handleDisconnect);
       socket.off("wifi_state_change", handleWifiStateChange);
+      clearInterval(tempInterval);
     };
   }, [toast]);
 
@@ -242,18 +265,32 @@ const SystemStatus = () => {
           <Card className="p-6 text-center">
             <CardContent className="p-0">
               <div className="mb-4">
-                <div className="text-3xl font-bold mb-2">20°C</div>
+                <div className="text-3xl font-bold mb-2">
+                  {typeof cpuTemp === 'number' ? `${cpuTemp}°C` : "--°C"}
+                </div>
+                <div className="text-sm text-muted-foreground">
+                  {cpuTemp && cpuTemp > 80 ? "High!" : 
+                   cpuTemp && cpuTemp > 60 ? "Warm" : 
+                   cpuTemp ? "Normal" : "Reading..."}
+                </div>
               </div>
-              <p className="text-muted-foreground font-bold">BATTERY TEMP</p>
+              <p className="text-muted-foreground font-bold">CPU TEMPERATURE</p>
             </CardContent>
           </Card>
           
           <Card className="p-6 text-center">
             <CardContent className="p-0">
               <div className="mb-4">
-                <div className="text-3xl font-bold mb-2">23°C</div>
+                <div className="text-3xl font-bold mb-2">
+                  {typeof gpuTemp === 'number' ? `${gpuTemp}°C` : "--°C"}
+                </div>
+                <div className="text-sm text-muted-foreground">
+                  {gpuTemp && gpuTemp > 80 ? "High!" : 
+                   gpuTemp && gpuTemp > 60 ? "Warm" : 
+                   gpuTemp ? "Normal" : "Reading..."}
+                </div>
               </div>
-              <p className="text-muted-foreground font-bold">CORE TEMP</p>
+              <p className="text-muted-foreground font-bold">GPU TEMPERATURE</p>
             </CardContent>
           </Card>
         </div>

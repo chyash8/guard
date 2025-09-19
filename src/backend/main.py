@@ -27,7 +27,7 @@ fastapi_app = FastAPI(
 # CORS middleware - only allow local connections
 fastapi_app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://127.0.0.1:8080", "http://localhost:8080"],
+    allow_origins=["http://127.0.0.1:8080", "http://localhost:8080", "http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -119,6 +119,47 @@ def get_brightness():
         return {"brightness": current}
     except Exception as e:
         return {"status": "failed", "error": str(e)}
+
+# --------------------------
+# System Monitoring
+# --------------------------
+
+def get_temperatures():
+    try:
+        # We know exact zones for Jetson:
+        # thermal_zone0 is cpu-thermal
+        # thermal_zone1 is gpu-thermal
+        cpu_temp = None
+        gpu_temp = None
+        
+        # Read CPU temperature (thermal_zone0)
+        try:
+            with open('/sys/class/thermal/thermal_zone0/temp', 'r') as f:
+                cpu_temp = round(int(f.read().strip()) / 1000.0, 1)
+        except Exception as e:
+            print(f"Error reading CPU temperature: {e}")
+            
+        # Read GPU temperature (thermal_zone1)
+        try:
+            with open('/sys/class/thermal/thermal_zone1/temp', 'r') as f:
+                gpu_temp = round(int(f.read().strip()) / 1000.0, 1)
+        except Exception as e:
+            print(f"Error reading GPU temperature: {e}")
+                
+        return {
+            "cpu": cpu_temp if cpu_temp is not None else 0.0,
+            "gpu": gpu_temp if gpu_temp is not None else 0.0
+        }
+    except Exception as e:
+        print(f"Error reading temperatures: {e}")
+        return None
+
+@fastapi_app.get("/system/temperature")
+async def system_temperature():
+    temps = get_temperatures()
+    if not temps:
+        raise HTTPException(status_code=500, detail="Could not read system temperatures")
+    return temps
 
 # --------------------------
 # Wi-Fi
