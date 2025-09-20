@@ -686,7 +686,7 @@ async def disconnect_wifi():
 # Voice Chat
 # --------------------------
 
-from .process_manager import voice_chat_manager
+from process_manager import voice_chat_manager
 
 @fastapi_app.post("/voice-chat/control")
 async def control_voice_chat(request: VoiceChatRequest):
